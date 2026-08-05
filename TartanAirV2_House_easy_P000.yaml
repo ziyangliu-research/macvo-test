@@ -1,0 +1,8 @@
+type: TartanAirv2_NoIMU
+name: House_easy_P000
+args:
+  root: /home/shiyo/Desktop/Datasets/tartanair_v2/House/Data_easy/P000
+  compressed: true
+  gtDepth: false
+  gtPose: true
+  gtFlow: false
