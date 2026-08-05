@@ -4,20 +4,44 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 
+KNOWN_WARNING_FILTERS = [
+    "ignore:instrumentor did not find the target function",
+    "ignore:In 'main'",
+    "ignore:The parameter 'pretrained' is deprecated since 0.13",
+    "ignore:Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13",
+]
+
+
 def abs_path(value: str | Path) -> Path:
     return Path(value).expanduser().resolve()
 
 
-def run(cmd: list[str], stage: str, cwd: Path | None = None) -> float:
+def subprocess_env(show_known_warnings: bool) -> dict[str, str]:
+    env = os.environ.copy()
+    if show_known_warnings:
+        return env
+    known = ",".join(KNOWN_WARNING_FILTERS)
+    existing = env.get("PYTHONWARNINGS", "").strip(",")
+    env["PYTHONWARNINGS"] = f"{existing},{known}" if existing else known
+    return env
+
+
+def run(
+    cmd: list[str],
+    stage: str,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> float:
     print(f"\n[{stage}] {' '.join(cmd)}", flush=True)
     start = time.perf_counter()
-    subprocess.run(cmd, cwd=cwd, check=True)
+    subprocess.run(cmd, cwd=cwd, check=True, env=env)
     sec = time.perf_counter() - start
     print(f"[{stage}] completed in {sec:.3f}s", flush=True)
     return sec
@@ -61,6 +85,12 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--timing", action="store_true")
     p.add_argument("--reuse_macvo_pose", action="store_true")
+    p.add_argument("--skip_ate", action="store_true")
+    p.add_argument(
+        "--show_known_warnings",
+        action="store_true",
+        help="Show known benign jaxtyping/Hydra/torchvision compatibility warnings.",
+    )
     return p
 
 
@@ -72,6 +102,7 @@ def main() -> None:
     work = abs_path(args.work_dir)
     pose_dir = work / "macvo_pose"
     work.mkdir(parents=True, exist_ok=True)
+    child_env = subprocess_env(args.show_known_warnings)
 
     pose_cmd = [
         sys.executable, str(root / "export_macvo_metric_pose.py"),
@@ -87,7 +118,16 @@ def main() -> None:
         pose_cmd.append("--timing")
     if args.reuse_macvo_pose:
         pose_cmd.append("--reuse_existing")
-    pose_sec = run(pose_cmd, "1/2 MAC-VO metric pose", cwd=macvo_repo)
+    if args.skip_ate:
+        pose_cmd.append("--skip_ate")
+    if args.show_known_warnings:
+        pose_cmd.append("--show_known_warnings")
+    pose_sec = run(
+        pose_cmd,
+        "1/2 MAC-VO metric pose",
+        cwd=macvo_repo,
+        env=child_env,
+    )
 
     packet_script = zipmap_repo / "run_pose_resplat_metric_packet_only.py"
     if not packet_script.is_file():
@@ -131,7 +171,19 @@ def main() -> None:
     if args.self_render_packets:
         packet_cmd.append("--self_render_packets")
 
-    packet_sec = run(packet_cmd, "2/2 ReSplat packets", cwd=zipmap_repo)
+    packet_sec = run(
+        packet_cmd,
+        "2/2 ReSplat packets",
+        cwd=zipmap_repo,
+        env=child_env,
+    )
+
+    pose_summary_path = pose_dir / "summary.json"
+    pose_summary = (
+        json.loads(pose_summary_path.read_text(encoding="utf-8"))
+        if pose_summary_path.is_file()
+        else None
+    )
     summary = {
         "pipeline": "MAC-VO stereo -> metric OpenCV c2w -> ReSplat packets",
         "frame_range": [args.start_index, args.end_index],
@@ -140,6 +192,7 @@ def main() -> None:
         "packet_stage_sec": packet_sec,
         "total_sec": pose_sec + packet_sec,
         "pose_output": str(pose_dir / "macvo_pose_results.npz"),
+        "pose_evaluation": None if pose_summary is None else pose_summary.get("evaluation"),
         "packet_output": str(work / args.packet_out_name),
         "fusion_performed": False,
     }
