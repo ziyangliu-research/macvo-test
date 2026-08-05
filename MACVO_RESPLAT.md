@@ -58,6 +58,7 @@ macvo_stereo_resplat_P000_0_10/
 ├── macvo_pose/
 │   ├── macvo_pose_results.npz
 │   ├── trajectory_c2w_opencv.txt
+│   ├── evaluation.json
 │   ├── summary.json
 │   └── macvo_runtime/
 ├── metric_pose/
@@ -71,6 +72,32 @@ macvo_stereo_resplat_P000_0_10/
 ├── run_summary.json
 └── combined_pipeline_summary.json
 ```
+
+## Pose evaluation
+
+When the MAC-VO data config uses `gtPose: true`, MAC-VO writes `ref_poses.npy`.
+The exporter matches estimated and reference poses by timestamp and reports:
+
+- ATE RMSE after SE(3) alignment
+- ATE RMSE after Sim(3) alignment
+- mean, median, standard deviation, minimum, and maximum ATE
+- the Sim(3) alignment scale
+
+The terminal prints:
+
+```text
+[ATE] SE(3) RMSE=... m | Sim(3) RMSE=... m
+```
+
+The full result is stored in:
+
+```text
+macvo_pose/evaluation.json
+macvo_pose/summary.json
+combined_pipeline_summary.json
+```
+
+Use `--skip_ate` to disable this evaluation.
 
 ## Pose contract
 
@@ -88,13 +115,31 @@ before ReSplat.
 
 ## Reusing an existing MAC-VO trajectory
 
-After a successful MAC-VO stage, rerun only packet generation by adding:
+After a successful MAC-VO stage, rerun pose export, ATE evaluation, and packet
+generation by adding:
 
 ```text
 --reuse_macvo_pose
 ```
 
 The exporter reuses the newest `poses.npy` below the current work directory.
+
+## Warning handling
+
+By default, the pipeline suppresses only these known benign compatibility warnings:
+
+- jaxtyping instrumentation warnings for nested output classes
+- Hydra's missing `_self_` composition warning
+- torchvision's deprecated `pretrained`/legacy `weights` warnings
+
+These warnings do not change the current inference result. To display them again,
+add:
+
+```text
+--show_known_warnings
+```
+
+All other warnings and errors remain visible.
 
 ## Current limitations
 
