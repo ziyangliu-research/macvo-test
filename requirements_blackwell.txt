@@ -1,5 +1,5 @@
-pypose >= 0.6.8
-opencv-python-headless
+pypose>=0.6.8
+opencv-python-headless==4.11.0.86
 evo
 matplotlib==3.8.4
 tabulate
@@ -10,15 +10,14 @@ einops
 timm==0.9.12
 rerun-sdk==0.21.0
 yacs
-# torch
-numpy<2.0.0
+# Keep the working Blackwell PyTorch/torchvision installation.
+numpy==1.26.4
 pyyaml
 wandb
-# torchvision
 pillow
 scipy
 flow_vis
 h5py
 xformers==0.0.33.post2
-# tensorrt
+# Optional for export/deployment paths.
 onnx
