@@ -2,16 +2,102 @@
 
 This integration keeps MAC-VO and ReSplat in separate Python subprocesses while
 using one Conda environment. MAC-VO first exports a metric OpenCV camera-to-world
-trajectory. The existing generic pose-to-ReSplat runner in the ZipMap research
-repository then generates one Gaussian packet per selected timestamp.
+trajectory. The generic pose-to-ReSplat runner then generates one Gaussian packet
+per selected timestamp. An optional third stage prepares the strict train/test
+camera scene required by the incremental 3DGS backend.
 
-## Required repositories
+## Recommended public entrypoint
 
-- MAC-VO: `/home/shiyo/Desktop/MAC-VO`
-- ZipMap research repository: `/home/shiyo/Desktop/ZipMap`
-- ReSplat: `/home/shiyo/Desktop/Resplat`
+Use the configuration-driven launcher instead of manually maintaining a long
+command:
 
-The ZipMap checkout must contain:
+```bash
+conda activate macvo_resplat
+cd /home/shiyo/Desktop/MAC-VO
+
+python run_pipeline_from_config.py
+```
+
+The default configuration is:
+
+```text
+Config/Pipeline/MACVO_ReSplat_P000_0_50.yaml
+```
+
+It reproduces the P000 `[0,50)` experiment and prepares:
+
+```text
+MAC-VO trajectory
+ReSplat refine_0 packets
+strict train/test camera scene
+backend_input_manifest.json
+```
+
+Before the first full run, validate all paths without running either neural
+network:
+
+```bash
+python run_pipeline_from_config.py --dry_run
+```
+
+The launcher saves:
+
+```text
+outputs/macvo_stereo_resplat_P000_0_50/
+├── resolved_pipeline_config.json
+└── resolved_pipeline_command.sh
+```
+
+These files record the fully resolved machine paths and the exact low-level
+command used for the experiment.
+
+## Small experiment overrides
+
+Do not copy and edit the whole command for a new frame range. Override only the
+changed YAML values:
+
+```bash
+python run_pipeline_from_config.py \
+  --set sequence.end_index=100 \
+  --set paths.work_dir=outputs/macvo_stereo_resplat_P000_0_100
+```
+
+Reuse an existing MAC-VO trajectory:
+
+```bash
+python run_pipeline_from_config.py \
+  --set runtime.reuse_macvo_pose=true
+```
+
+Disable camera-scene preparation and generate packets only:
+
+```bash
+python run_pipeline_from_config.py \
+  --set split.prepare_camera_scene=false
+```
+
+## Repository layout assumptions
+
+The public P000 config uses repository-relative paths:
+
+```text
+Desktop/
+├── MAC-VO/
+├── ZipMap/
+└── Resplat/
+```
+
+The dataset root is read from:
+
+```text
+Config/Sequence/TartanAirV2_House_easy_P000.yaml
+```
+
+The left/right image directories are derived automatically from that root, so
+they are not duplicated in the pipeline configuration.
+
+The current generic pose-to-ReSplat implementation is still read from the
+ZipMap research repository:
 
 ```text
 run_pose_resplat_metric_packet_only.py
@@ -19,42 +105,39 @@ run_zipmap_resplat_metric_packet_only.py
 run_gt_resplat_fusion_api_refine_compare_v5_skipfusion_selfrender.py
 ```
 
-## P000 0-10 command
+This is a temporary integration dependency. Before the final public release,
+the generic ReSplat packet generator should be extracted into a standalone
+module so that the MAC-VO system no longer depends on a repository named
+`ZipMap`.
 
-```bash
-cd /home/shiyo/Desktop/MAC-VO
+## Camera-scene preparation script
 
-CUDA_VISIBLE_DEVICES=0 TORCH_COMPILE_DISABLE=1 \
-python run_macvo_resplat_packet_only.py \
-  --macvo_repo /home/shiyo/Desktop/MAC-VO \
-  --odom /home/shiyo/Desktop/MAC-VO/Config/Experiment/MACVO/MACVO_Performant.yaml \
-  --data /home/shiyo/Desktop/MAC-VO/Config/Sequence/TartanAirV2_House_easy_P000.yaml \
-  --zipmap_repo /home/shiyo/Desktop/ZipMap \
-  --resplat_repo /home/shiyo/Desktop/Resplat \
-  --left_dir /home/shiyo/Desktop/Datasets/tartanair_v2/House/Data_easy/P000/image_lcam_front \
-  --right_dir /home/shiyo/Desktop/Datasets/tartanair_v2/House/Data_easy/P000/image_rcam_front \
-  --work_dir /home/shiyo/Desktop/MAC-VO/outputs/macvo_stereo_resplat_P000_0_10 \
-  --scene_name P000 \
-  --start_index 0 \
-  --end_index 10 \
-  --stride 1 \
-  --stereo_baseline 0.25000006 \
-  --resplat_experiment tartanair_p000_ft \
-  --resplat_packet_stage init \
-  --refine_steps 0 \
-  --refine_use_target false \
-  --resplat_target_camera left \
-  --resplat_target_offset 0 \
-  --packet_out_name packets \
-  --fx 320 --fy 320 --cx 320 --cy 320 \
-  --device cuda:0 \
-  --timing
+The configuration expects the script at:
+
+```text
+/home/shiyo/Desktop/MAC-VO/prepare_zipmap_packet_camera_scene_only.py
 ```
+
+Repository-relative form:
+
+```text
+prepare_zipmap_packet_camera_scene_only.py
+```
+
+This script must be committed to `macvo-test` before the integration branch can
+be considered self-contained and ready for public release.
+
+## Low-level entrypoint
+
+`run_macvo_resplat_packet_only.py` remains available as an advanced interface.
+It exposes all individual parameters for ablations and debugging. The config
+launcher is the recommended interface for routine experiments and public
+reproduction.
 
 ## Expected output
 
 ```text
-macvo_stereo_resplat_P000_0_10/
+macvo_stereo_resplat_P000_0_50/
 ├── macvo_pose/
 │   ├── macvo_pose_results.npz
 │   ├── trajectory_c2w_opencv.txt
@@ -68,36 +151,18 @@ macvo_stereo_resplat_P000_0_10/
 │   └── refine_0/
 │       ├── P000_0000.pt
 │       ├── ...
-│       └── P000_0009.pt
+│       └── P000_0049.pt
+├── 3dgs_camera_scene_macvo_strict_split/
+│   ├── images/
+│   ├── transforms_train.json
+│   ├── transforms_test.json
+│   └── points3d.ply
+├── backend_input_manifest.json
+├── resolved_pipeline_config.json
+├── resolved_pipeline_command.sh
 ├── run_summary.json
 └── combined_pipeline_summary.json
 ```
-
-## Pose evaluation
-
-When the MAC-VO data config uses `gtPose: true`, MAC-VO writes `ref_poses.npy`.
-The exporter matches estimated and reference poses by timestamp and reports:
-
-- ATE RMSE after SE(3) alignment
-- ATE RMSE after Sim(3) alignment
-- mean, median, standard deviation, minimum, and maximum ATE
-- the Sim(3) alignment scale
-
-The terminal prints:
-
-```text
-[ATE] SE(3) RMSE=... m | Sim(3) RMSE=... m
-```
-
-The full result is stored in:
-
-```text
-macvo_pose/evaluation.json
-macvo_pose/summary.json
-combined_pipeline_summary.json
-```
-
-Use `--skip_ate` to disable this evaluation.
 
 ## Pose contract
 
@@ -110,41 +175,29 @@ Use `--skip_ate` to disable this evaluation.
 - `need_interp`
 - `valid`
 
-MAC-VO is stereo and already metric, so no additional trajectory scale is applied
-before ReSplat.
+MAC-VO is stereo and already metric, so no additional trajectory scale is
+applied before ReSplat.
 
-## Reusing an existing MAC-VO trajectory
+When `ref_poses.npy` is available, `evaluation.json` and the console report ATE
+RMSE after SE(3) and Sim(3) alignment.
 
-After a successful MAC-VO stage, rerun pose export, ATE evaluation, and packet
-generation by adding:
+## Warning policy
 
-```text
---reuse_macvo_pose
+Known non-fatal compatibility warnings from jaxtyping, Hydra, and the deprecated
+torchvision `pretrained` argument are filtered by default. Other warnings and
+all errors remain visible. Set:
+
+```bash
+python run_pipeline_from_config.py \
+  --set runtime.show_known_warnings=true
 ```
 
-The exporter reuses the newest `poses.npy` below the current work directory.
-
-## Warning handling
-
-By default, the pipeline suppresses only these known benign compatibility warnings:
-
-- jaxtyping instrumentation warnings for nested output classes
-- Hydra's missing `_self_` composition warning
-- torchvision's deprecated `pretrained`/legacy `weights` warnings
-
-These warnings do not change the current inference result. To display them again,
-add:
-
-```text
---show_known_warnings
-```
-
-All other warnings and errors remain visible.
+to restore the known warnings.
 
 ## Current limitations
 
-- `--stride` must be 1 because the native MAC-VO sequence runner clips a contiguous range.
-- Packet generation uses MAC-VO's official saved trajectory after termination and
-  post-processing. `need_interp` is recorded for diagnosis.
-- The pipeline generates packets only. Fusion and incremental Gaussian optimization
-  remain separate backend stages.
+- `stride` must be 1 because the native MAC-VO sequence runner clips a contiguous range.
+- Packet generation uses MAC-VO's official saved trajectory after termination and post-processing.
+- `need_interp` is recorded for diagnosis.
+- The pipeline prepares backend inputs but does not start incremental Gaussian optimization.
+- The pose-to-ReSplat implementation still has a temporary dependency on the ZipMap research repository.
