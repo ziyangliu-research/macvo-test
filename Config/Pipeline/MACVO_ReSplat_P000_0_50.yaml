@@ -1,0 +1,58 @@
+version: 1
+
+# Public experiment configuration. Relative paths are resolved from the MAC-VO
+# repository root. Machine-specific values may be overridden with --set.
+paths:
+  macvo_repo: .
+  odom: Config/Experiment/MACVO/MACVO_Performant.yaml
+  data: Config/Sequence/TartanAirV2_House_easy_P000.yaml
+  packet_generator_repo: ../ZipMap
+  resplat_repo: ../Resplat
+  scene_prepare_script: prepare_zipmap_packet_camera_scene_only.py
+  work_dir: outputs/macvo_stereo_resplat_P000_0_50
+
+sequence:
+  scene_name: P000
+  start_index: 0
+  end_index: 50
+  stride: 1
+
+camera:
+  stereo_baseline: 0.25000006
+  fx: 320.0
+  fy: 320.0
+  cx: 320.0
+  cy: 320.0
+  width: 640
+  height: 640
+  left_subdir: image_lcam_front
+  right_subdir: image_rcam_front
+  image_pattern: "{index:06d}_lcam_front.png"
+  image_mode: symlink
+
+resplat:
+  experiment: tartanair_p000_ft
+  packet_stage: init
+  refine_steps: "0"
+  refine_use_target: false
+  target_camera: left
+  target_offset: 0
+  packet_out_name: packets
+  backend_packet_stage: refine_0
+  self_render_packets: false
+
+split:
+  prepare_camera_scene: true
+  output_scene_name: 3dgs_camera_scene_macvo_strict_split
+  packet_extrinsic_key: target_extrinsics
+  packet_extrinsic_type: Twc
+  split_every: 5
+  split_offset: 4
+  split_index_mode: local_index
+
+runtime:
+  device: cuda:0
+  timing: true
+  reuse_macvo_pose: false
+  skip_ate: false
+  show_known_warnings: false
