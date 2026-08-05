@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -16,13 +17,34 @@ from pathlib import Path
 import numpy as np
 
 
+KNOWN_WARNING_FILTERS = [
+    "ignore:instrumentor did not find the target function",
+    "ignore:In 'main'",
+    "ignore:The parameter 'pretrained' is deprecated since 0.13",
+    "ignore:Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13",
+]
+
+
 def abs_path(value: str | Path) -> Path:
     return Path(value).expanduser().resolve()
 
 
+def subprocess_env(show_known_warnings: bool) -> dict[str, str]:
+    env = os.environ.copy()
+    if show_known_warnings:
+        return env
+    known = ",".join(KNOWN_WARNING_FILTERS)
+    existing = env.get("PYTHONWARNINGS", "").strip(",")
+    env["PYTHONWARNINGS"] = f"{existing},{known}" if existing else known
+    return env
+
+
 def quat_xyzw_to_matrix(q: np.ndarray) -> np.ndarray:
     q = np.asarray(q, dtype=np.float64)
-    q /= np.linalg.norm(q)
+    norm = np.linalg.norm(q)
+    if norm < 1e-12:
+        raise ValueError(f"Invalid near-zero quaternion: {q}")
+    q /= norm
     x, y, z, w = q
     return np.array([
         [1 - 2 * (y*y + z*z), 2 * (x*y - z*w), 2 * (x*z + y*w)],
@@ -69,6 +91,125 @@ def load_need_interp(space: Path, count: int) -> np.ndarray:
     return values
 
 
+def umeyama_alignment(
+    source_xyz: np.ndarray,
+    target_xyz: np.ndarray,
+    with_scale: bool,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    source = np.asarray(source_xyz, dtype=np.float64)
+    target = np.asarray(target_xyz, dtype=np.float64)
+    if source.shape != target.shape or source.ndim != 2 or source.shape[1] != 3:
+        raise ValueError(
+            f"Expected matching [N,3] trajectories, got {source.shape} and {target.shape}"
+        )
+    if len(source) < 2:
+        raise ValueError("At least two matched poses are required for alignment")
+
+    source_mean = source.mean(axis=0)
+    target_mean = target.mean(axis=0)
+    source_centered = source - source_mean
+    target_centered = target - target_mean
+
+    covariance = target_centered.T @ source_centered / len(source)
+    U, singular_values, Vt = np.linalg.svd(covariance)
+    signs = np.ones(3, dtype=np.float64)
+    if np.linalg.det(U @ Vt) < 0:
+        signs[-1] = -1.0
+    rotation = U @ np.diag(signs) @ Vt
+
+    if with_scale:
+        variance = float(np.mean(np.sum(source_centered**2, axis=1)))
+        if variance < 1e-15:
+            raise ValueError("Estimated trajectory has near-zero translation variance")
+        scale = float(np.dot(singular_values, signs) / variance)
+    else:
+        scale = 1.0
+
+    translation = target_mean - scale * (rotation @ source_mean)
+    return scale, rotation, translation
+
+
+def ate_statistics(errors: np.ndarray) -> dict[str, float]:
+    values = np.asarray(errors, dtype=np.float64).reshape(-1)
+    return {
+        "rmse": float(np.sqrt(np.mean(values**2))),
+        "mean": float(np.mean(values)),
+        "median": float(np.median(values)),
+        "std": float(np.std(values)),
+        "min": float(np.min(values)),
+        "max": float(np.max(values)),
+    }
+
+
+def evaluate_against_reference(
+    poses_path: Path,
+    timestamps_ns: np.ndarray,
+    estimated_pose7: np.ndarray,
+) -> dict[str, object]:
+    reference_path = poses_path.parent / "ref_poses.npy"
+    if not reference_path.is_file():
+        return {
+            "available": False,
+            "reason": "ref_poses.npy was not generated; enable gtPose in the MAC-VO data config",
+        }
+
+    reference = np.asarray(np.load(reference_path), dtype=np.float64)
+    if reference.ndim != 2 or reference.shape[1] != 8:
+        return {
+            "available": False,
+            "reason": f"Expected ref_poses.npy [N,8], got {reference.shape}",
+            "reference_file": str(reference_path),
+        }
+
+    reference_by_time = {
+        int(round(row[0])): row[1:8]
+        for row in reference
+    }
+    matched_est: list[np.ndarray] = []
+    matched_ref: list[np.ndarray] = []
+    matched_timestamps: list[int] = []
+    for timestamp, estimate in zip(timestamps_ns, estimated_pose7):
+        reference_pose = reference_by_time.get(int(timestamp))
+        if reference_pose is None:
+            continue
+        matched_est.append(np.asarray(estimate, dtype=np.float64))
+        matched_ref.append(np.asarray(reference_pose, dtype=np.float64))
+        matched_timestamps.append(int(timestamp))
+
+    if len(matched_est) < 2:
+        return {
+            "available": False,
+            "reason": "fewer than two timestamps matched between poses.npy and ref_poses.npy",
+            "reference_file": str(reference_path),
+            "matched_frames": len(matched_est),
+        }
+
+    estimated_xyz = np.stack(matched_est)[:, :3]
+    reference_xyz = np.stack(matched_ref)[:, :3]
+    result: dict[str, object] = {
+        "available": True,
+        "reference_file": str(reference_path),
+        "matched_frames": len(matched_est),
+        "matched_timestamps_ns": matched_timestamps,
+    }
+
+    for name, with_scale in (("se3", False), ("sim3", True)):
+        scale, rotation, translation = umeyama_alignment(
+            estimated_xyz, reference_xyz, with_scale=with_scale
+        )
+        aligned = (
+            scale * (rotation @ estimated_xyz.T)
+        ).T + translation[None]
+        errors = np.linalg.norm(aligned - reference_xyz, axis=1)
+        result[name] = {
+            "alignment_scale": scale,
+            "alignment_rotation": rotation.tolist(),
+            "alignment_translation": translation.tolist(),
+            "ate_m": ate_statistics(errors),
+        }
+    return result
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="MAC-VO -> metric OpenCV c2w NPZ")
     p.add_argument("--macvo_repo", required=True)
@@ -81,6 +222,12 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--python", default=sys.executable)
     p.add_argument("--timing", action="store_true")
     p.add_argument("--reuse_existing", action="store_true")
+    p.add_argument("--skip_ate", action="store_true")
+    p.add_argument(
+        "--show_known_warnings",
+        action="store_true",
+        help="Show known benign jaxtyping/Hydra/torchvision compatibility warnings.",
+    )
     return p
 
 
@@ -113,7 +260,12 @@ def main() -> None:
             cmd.append("--timing")
         print("[MAC-VO]", " ".join(cmd), flush=True)
         start = time.perf_counter()
-        subprocess.run(cmd, cwd=repo, check=True)
+        subprocess.run(
+            cmd,
+            cwd=repo,
+            check=True,
+            env=subprocess_env(args.show_known_warnings),
+        )
         run_sec = time.perf_counter() - start
 
     poses_path = newest_file(runtime_root, "poses.npy")
@@ -122,7 +274,7 @@ def main() -> None:
     if raw.ndim != 2 or raw.shape[1] != 8:
         raise ValueError(f"Expected poses.npy [N,8], got {raw.shape}")
 
-    timestamps_ns = raw[:, 0].astype(np.int64)
+    timestamps_ns = np.rint(raw[:, 0]).astype(np.int64)
     pose7 = raw[:, 1:8]
     T_tartan = np.stack([pose7_to_matrix(row) for row in pose7])
     T_abs_cv = T_tartan @ tartan_from_cv()[None]
@@ -153,6 +305,16 @@ def main() -> None:
 
     trajectory_path = out / "trajectory_c2w_opencv.txt"
     np.savetxt(trajectory_path, T_cv.reshape(len(T_cv), 16), fmt="%.9f")
+
+    evaluation: dict[str, object]
+    if args.skip_ate:
+        evaluation = {"available": False, "reason": "disabled by --skip_ate"}
+    else:
+        evaluation = evaluate_against_reference(poses_path, timestamps_ns, pose7)
+    (out / "evaluation.json").write_text(
+        json.dumps(evaluation, indent=2), encoding="utf-8"
+    )
+
     summary = {
         "source": "MAC-VO",
         "pose_file": str(poses_path),
@@ -163,10 +325,17 @@ def main() -> None:
         "num_need_interp": int(need_interp.sum()),
         "macvo_runtime_sec": run_sec,
         "postprocess_note": "poses.npy is the official trajectory saved after MAC-VO termination/post-processing",
+        "evaluation": evaluation,
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"[Done] pose NPZ: {result_path}")
     print(f"[Done] need_interp: {int(need_interp.sum())}/{len(need_interp)}")
+    if evaluation.get("available"):
+        se3 = evaluation["se3"]["ate_m"]["rmse"]
+        sim3 = evaluation["sim3"]["ate_m"]["rmse"]
+        print(f"[ATE] SE(3) RMSE={se3:.6f} m | Sim(3) RMSE={sim3:.6f} m")
+    else:
+        print(f"[ATE] unavailable: {evaluation.get('reason', 'unknown reason')}")
 
 
 if __name__ == "__main__":
