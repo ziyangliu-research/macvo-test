@@ -1,0 +1,119 @@
+version: 1
+
+# Throughput configuration: no per-packet evaluation, W&B, or checkpoint I/O.
+
+paths:
+  macvo_repo: .
+  resplat_repo: ../Resplat
+  gs_repo: ../gaussian-splatting
+  odom_config: Config/Experiment/MACVO/MACVO_Performant.yaml
+  data_config: Config/Sequence/TartanAirV2_House_easy_P000.yaml
+  resplat_checkpoint: null
+  work_dir: outputs/macvo_resplat_async_fast_P000_0_50
+
+sequence:
+  start_index: 0
+  end_index: 50
+
+camera:
+  stereo_baseline: 0.25000006
+  fx: 320.0
+  fy: 320.0
+  cx: 320.0
+  cy: 320.0
+  left_subdir: image_lcam_front
+  right_subdir: image_rcam_front
+  left_pattern: "{index:06d}_lcam_front.png"
+  right_pattern: "{index:06d}_rcam_front.png"
+
+pose_frontend:
+  # MAC-VO writes the previous two-frame optimization result back when the next
+  # frame is processed. Commit t-1 after processing t instead of publishing a
+  # provisional pose that may later change.
+  commit_policy: one_frame_delayed
+  dedicated_cuda_stream: true
+
+resplat_frontend:
+  experiment: tartanair_p000_ft
+  device: cuda:0
+  refine_steps: 0
+  refine_use_target: false
+  # Match the validated serial packet generator.
+  deterministic: false
+  overrides: []
+  # shared_tensors reuses MAC-VO's decoded stereo frame. Use file_paths only
+  # for compatibility diagnosis against the previous serial script.
+  input_mode: shared_tensors
+  # GPU handoff removes the packet GPU->CPU->GPU copy. Queue size bounds VRAM.
+  handoff_mode: gpu
+  strict_validation: false
+
+split:
+  split_every: 5
+  split_offset: 4
+  split_index_mode: local_index
+
+runtime:
+  backend_mode: incremental
+  queue_size: 2
+  poll_timeout_sec: 0.05
+  initialization_timeout_sec: 600.0
+  preload: false
+  pin_packet_memory: true
+
+backend:
+  output_name: incremental_async_fast_i100_dp50_latest_packet_reset
+  device: cuda:0
+  sh_degree: 3
+  local_map_size: 10
+  iterations_per_packet: 100
+  reset_new_packet_opacity: true
+  new_packet_reset_max_opacity: 0.01
+  maintenance_mode: standard
+  maintenance_after_local_iteration: 50
+  maintenance_grad_threshold: -1.0
+  maintenance_min_opacity: 0.005
+  maintenance_max_screen_size: -1.0
+
+  # The old serial backend obtained this implicitly from the complete camera
+  # scene. A true online system cannot know the future trajectory. Metric input
+  # therefore uses an explicit fixed LR scale; validate/ablate this value.
+  spatial_lr_scale: 1.0
+  minimum_scene_extent: 1.0
+
+  white_background: false
+  antialiasing: false
+  eval_before_optimization: false
+  eval_every_train_packets: 1
+  eval_max_views: 0
+  save_every_train_packets: 0
+  save_final_ply: true
+
+  wandb_mode: disabled
+  wandb_project: macvo-resplat-3dgs-async
+  wandb_run_name: ""
+  wandb_log_interval: 10
+  dedicated_cuda_stream: true
+  invalid_pose_policy: skip
+  write_runtime_artifacts: false
+  evaluation_enabled: false
+
+  optimization:
+    iterations: 4000
+    position_lr_init: 0.00016
+    position_lr_final: 0.0000016
+    position_lr_delay_mult: 0.01
+    position_lr_max_steps: 30000
+    feature_lr: 0.0025
+    opacity_lr: 0.025
+    scaling_lr: 0.005
+    rotation_lr: 0.001
+    exposure_lr_init: 0.01
+    exposure_lr_final: 0.001
+    exposure_lr_delay_steps: 0
+    exposure_lr_delay_mult: 0.0
+    percent_dense: 0.01
+    lambda_dssim: 0.2
+    densify_grad_threshold: 0.0002
+    random_background: false
+    optimizer_type: default
