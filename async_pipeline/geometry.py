@@ -103,7 +103,6 @@ def rotation_matrix_to_quaternion_xyzw(matrix: torch.Tensor) -> torch.Tensor:
             min=0.0,
         )
     )
-    # Candidate rows are wxyz, x-leading, y-leading, z-leading.
     candidates_wxyz = torch.stack(
         [
             torch.stack([q_abs[..., 0] ** 2, m21 - m12, m02 - m20, m10 - m01], dim=-1),
@@ -119,7 +118,6 @@ def rotation_matrix_to_quaternion_xyzw(matrix: torch.Tensor) -> torch.Tensor:
     wxyz = torch.gather(candidates_wxyz, -2, gather_index).squeeze(-2)
     xyzw = torch.cat([wxyz[..., 1:], wxyz[..., :1]], dim=-1)
     xyzw = normalize_quaternion_xyzw(xyzw)
-    # q and -q are equivalent; canonicalize w >= 0 for deterministic tests.
     return torch.where(xyzw[..., 3:4] < 0, -xyzw, xyzw)
 
 
@@ -164,16 +162,55 @@ def rotate_local_quaternions_to_world_xyzw(
     )
 
 
+def rotate_harmonics_local_to_world(
+    harmonics_local: torch.Tensor,
+    T_world_from_local: torch.Tensor,
+) -> torch.Tensor:
+    """Rotate real SH coefficients from the local camera basis to world basis.
+
+    ReSplat's current configuration uses ``no_rotate_sh=true``. Consequently a
+    packet inferred with identity extrinsics carries SH coefficients in the
+    canonical left-camera basis. Rigidly moving only means/covariances is not
+    appearance preserving for degree > 0. This function mirrors ReSplat's own
+    ``src.misc.sh_rotation.rotate_sh`` implementation using the c2w rotation.
+    """
+
+    if harmonics_local.ndim != 3 or harmonics_local.shape[-2] != 3:
+        raise ValueError(
+            "harmonics_local must have shape [N,3,D], got "
+            f"{tuple(harmonics_local.shape)}"
+        )
+    coeff_count = int(harmonics_local.shape[-1])
+    degree_plus_one = int(round(coeff_count**0.5))
+    if degree_plus_one * degree_plus_one != coeff_count:
+        raise ValueError(f"SH coefficient count must be a square, got {coeff_count}")
+    if coeff_count == 1:
+        return harmonics_local
+
+    R = T_world_from_local[:3, :3].to(
+        device=harmonics_local.device, dtype=harmonics_local.dtype
+    )
+    identity = torch.eye(3, device=R.device, dtype=R.dtype)
+    if torch.allclose(R, identity, atol=1e-7, rtol=1e-7):
+        return harmonics_local
+
+    try:
+        from src.misc.sh_rotation import rotate_sh
+    except Exception as exc:
+        raise RuntimeError(
+            "Rotating ReSplat SH coefficients requires the ReSplat repository and "
+            "its e3nn dependency to be importable before backend packet alignment."
+        ) from exc
+
+    # [1,1,3,3] broadcasts across Gaussian and RGB dimensions of [N,3,D].
+    return rotate_sh(harmonics_local, R.reshape(1, 1, 3, 3))
+
+
 def align_local_packet_to_world(
     packet: LocalGaussianPacket,
     T_world_from_left: torch.Tensor,
 ) -> LocalGaussianPacket:
-    """Rigidly align a left-local ReSplat packet to the global map frame.
-
-    Means and covariance orientation change under the common SE(3). Activated
-    scales and opacity stay unchanged. SH coefficients are intentionally left
-    unchanged to reproduce the current ``EncoderReSplat`` direct-world path.
-    """
+    """Rigidly align a left-local ReSplat packet to the global map frame."""
 
     packet.validate()
     if packet.coordinate_frame != "left_camera_local":
@@ -183,6 +220,7 @@ def align_local_packet_to_world(
     rotations_world = rotate_local_quaternions_to_world_xyzw(
         packet.rotations_xyzw, T
     )
+    harmonics_world = rotate_harmonics_local_to_world(packet.harmonics, T)
     context_world = T.unsqueeze(0) @ packet.context_extrinsics.to(
         device=T.device, dtype=T.dtype
     )
@@ -192,15 +230,17 @@ def align_local_packet_to_world(
             "aligned_from": "left_camera_local",
             "alignment_rule": (
                 "means=R*x+t; covariance orientation=R*R_local; "
-                "scale/SH/opacity unchanged"
+                "SH=WignerD(R)*SH_local; scale/opacity unchanged"
             ),
             "rotation_convention": "ReSplat xyzw",
+            "sh_basis": "rotated from canonical left-camera basis to world basis",
         }
     )
     return replace(
         packet,
         means=means_world,
         rotations_xyzw=rotations_world,
+        harmonics=harmonics_world,
         context_extrinsics=context_world,
         coordinate_frame="world",
         metadata=metadata,
