@@ -32,6 +32,12 @@ class ThreadWorker(Generic[TIn, TOut]):
     coordinator waits for all workers to become ready before reading the first
     frame, avoiding concurrent setup races and excluding model loading from the
     streaming throughput measurement.
+
+    Worker threads are daemons deliberately. A CUDA illegal-address error poisons
+    the process CUDA context and a Python thread blocked inside a native CUDA call
+    cannot be cancelled safely. The normal success path still joins every worker,
+    while the fatal-error path is allowed to terminate the process instead of
+    hanging indefinitely on a corrupted CUDA context.
     """
 
     def __init__(
@@ -55,7 +61,14 @@ class ThreadWorker(Generic[TIn, TOut]):
         self.output: queue.Queue[TOut | StopSignal | WorkerFailure] = queue.Queue()
         self._stop_event = threading.Event()
         self._ready_event = threading.Event()
-        self._thread = threading.Thread(target=self._run, name=name, daemon=False)
+        self._thread = threading.Thread(
+            target=self._run,
+            name=name,
+            # Fatal CUDA errors cannot be recovered inside the same process. A
+            # daemon worker prevents a poisoned native call from keeping Python
+            # alive after the coordinator has already raised the root failure.
+            daemon=True,
+        )
 
     def start(self) -> None:
         self._thread.start()
@@ -99,6 +112,14 @@ class ThreadWorker(Generic[TIn, TOut]):
 
     def request_stop(self) -> None:
         self._stop_event.set()
+        # Wake a worker waiting in Queue.get(). If the queue is full, the worker
+        # will observe _stop_event after its current task. A worker stuck in a
+        # native CUDA call cannot be interrupted; daemon=True handles that fatal
+        # process-exit case.
+        try:
+            self.input.put_nowait(StopSignal(source="abort"))
+        except queue.Full:
+            pass
 
     def raise_if_failed(self) -> None:
         with self.output.mutex:
@@ -136,7 +157,7 @@ class ThreadWorker(Generic[TIn, TOut]):
                 if isinstance(item, StopSignal):
                     break
                 self._emit(self.process(item))
-            if self.teardown is not None:
+            if self.teardown is not None and not self._stop_event.is_set():
                 self._emit(self.teardown())
             self.output.put(StopSignal(source=self.name))
         except BaseException as exc:
