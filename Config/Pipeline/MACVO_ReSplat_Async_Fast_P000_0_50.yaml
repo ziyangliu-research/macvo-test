@@ -1,6 +1,12 @@
 version: 1
 
-# Throughput configuration: no per-packet evaluation, W&B, or checkpoint I/O.
+# Stable single-GPU throughput configuration.
+# Removes evaluation, W&B, periodic PLY, and per-packet JSON overhead while
+# avoiding the multi-stream + GPU-handoff combination that triggered an illegal
+# CUDA memory access on the current RTX PRO 6000 system.
+#
+# The pipeline remains asynchronous at the component/queue level. CUDA work uses
+# the safe scheduling behavior already validated by the compatibility run.
 
 paths:
   macvo_repo: .
@@ -27,25 +33,23 @@ camera:
   right_pattern: "{index:06d}_rcam_front.png"
 
 pose_frontend:
-  # MAC-VO writes the previous two-frame optimization result back when the next
-  # frame is processed. Commit t-1 after processing t instead of publishing a
-  # provisional pose that may later change.
   commit_policy: one_frame_delayed
-  dedicated_cuda_stream: true
+  # MAC-VO contains custom CUDA components whose concurrent execution with the
+  # backend's custom rasterizer is not yet proven stream-safe in one process.
+  dedicated_cuda_stream: false
 
 resplat_frontend:
   experiment: tartanair_p000_ft
   device: cuda:0
   refine_steps: 0
   refine_use_target: false
-  # Match the validated serial packet generator.
   deterministic: false
   overrides: []
-  # shared_tensors reuses MAC-VO's decoded stereo frame. Use file_paths only
-  # for compatibility diagnosis against the previous serial script.
+  # Reuse the frame already decoded by MAC-VO.
   input_mode: shared_tensors
-  # GPU handoff removes the packet GPU->CPU->GPU copy. Queue size bounds VRAM.
-  handoff_mode: gpu
+  # Use the validated ownership boundary. This avoids retaining ReSplat-owned GPU
+  # allocations while the backend and MAC-VO launch kernels from other threads.
+  handoff_mode: pinned_cpu
   strict_validation: false
 
 split:
@@ -74,26 +78,22 @@ backend:
   maintenance_grad_threshold: -1.0
   maintenance_min_opacity: 0.005
   maintenance_max_screen_size: -1.0
-
-  # The old serial backend obtained this implicitly from the complete camera
-  # scene. A true online system cannot know the future trajectory. Metric input
-  # therefore uses an explicit fixed LR scale; validate/ablate this value.
   spatial_lr_scale: 1.0
   minimum_scene_extent: 1.0
-
   white_background: false
   antialiasing: false
+
+  # Throughput mode: retain the algorithm, remove measurement/output overhead.
   eval_before_optimization: false
   eval_every_train_packets: 1
   eval_max_views: 0
   save_every_train_packets: 0
   save_final_ply: true
-
   wandb_mode: disabled
   wandb_project: macvo-resplat-3dgs-async
   wandb_run_name: ""
   wandb_log_interval: 10
-  dedicated_cuda_stream: true
+  dedicated_cuda_stream: false
   invalid_pose_policy: skip
   write_runtime_artifacts: false
   evaluation_enabled: false
