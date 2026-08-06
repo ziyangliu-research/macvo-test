@@ -4,10 +4,8 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Iterator, Optional
 
-import numpy as np
 import torch
 
 from .contracts import (
@@ -80,13 +78,7 @@ class MacvoRuntimeConfig:
 
 
 class MacvoPoseFrontend:
-    """Persistent in-process MAC-VO runtime with committed streaming poses.
-
-    MAC-VO's two-frame optimizer writes the previous optimization result back at
-    the beginning of the next pair. Therefore the default policy emits frame t-1
-    after processing frame t. This preserves a stable pose without waiting for
-    the complete sequence and naturally introduces the known one-frame delay.
-    """
+    """Persistent in-process MAC-VO runtime with committed streaming poses."""
 
     def __init__(self, config: MacvoRuntimeConfig) -> None:
         self.config = config
@@ -105,24 +97,43 @@ class MacvoPoseFrontend:
             return
         if str(self.repo) not in sys.path:
             sys.path.insert(0, str(self.repo))
+
         from DataLoader import SequenceBase, StereoFrame, smart_transform
         from Odometry.MACVO import MACVO
-        from Utility.Config import asNamespace, load_config
+        from Utility.Config import load_config
 
-        odom_cfg, odom_dict = load_config(self.config.odom_config.expanduser().resolve())
+        odom_cfg, _ = load_config(self.config.odom_config.expanduser().resolve())
         data_cfg, _ = load_config(self.config.data_config.expanduser().resolve())
-        sequence = smart_transform(
+
+        if not hasattr(odom_cfg, "Odometry"):
+            raise ValueError(
+                f"MAC-VO odometry config has no Odometry section: {self.config.odom_config}"
+            )
+        if not hasattr(odom_cfg.Odometry, "frontend"):
+            raise ValueError(
+                "MAC-VO Odometry section has no frontend entry; the complete root "
+                "experiment config must be supplied"
+            )
+        if not hasattr(odom_cfg, "Preprocess"):
+            raise ValueError(
+                f"MAC-VO odometry config has no Preprocess section: {self.config.odom_config}"
+            )
+
+        sequence = (
             SequenceBase[StereoFrame]
             .instantiate(data_cfg.type, data_cfg.args)
-            .clip(self.config.start_index, self.config.end_index),
-            odom_cfg.Preprocess,
+            .clip(self.config.start_index, self.config.end_index)
         )
+        sequence = smart_transform(sequence, odom_cfg.Preprocess)
         if self.config.preload:
             sequence = sequence.preload()
+
         self.sequence = sequence
-        self.system = MACVO[StereoFrame].from_config(
-            asNamespace({"Odometry": odom_dict})
-        )
+        # MACVO.from_config expects the complete root namespace and internally
+        # reads cfg.Odometry. The previous implementation wrapped the complete
+        # dictionary inside another Odometry key, producing cfg.Odometry.Odometry.
+        self.system = MACVO[StereoFrame].from_config(odom_cfg)
+
         if torch.cuda.is_available() and self.config.dedicated_cuda_stream:
             current = torch.cuda.current_stream()
             self.stream = torch.cuda.Stream()
@@ -143,12 +154,16 @@ class MacvoPoseFrontend:
                     sequence_index=sequence_index,
                     frame_index=frame_index,
                     timestamp_ns=frame_index,
-                    left_path=root
-                    / self.config.left_subdir
-                    / self.config.left_pattern.format(index=frame_index),
-                    right_path=root
-                    / self.config.right_subdir
-                    / self.config.right_pattern.format(index=frame_index),
+                    left_path=(
+                        root
+                        / self.config.left_subdir
+                        / self.config.left_pattern.format(index=frame_index)
+                    ),
+                    right_path=(
+                        root
+                        / self.config.right_subdir
+                        / self.config.right_pattern.format(index=frame_index)
+                    ),
                     is_test=False,
                 )
             )
@@ -172,19 +187,19 @@ class MacvoPoseFrontend:
             )
             left = frame.stereo.imageL[0].detach().cpu().float().contiguous()
             right = frame.stereo.imageR[0].detach().cpu().float().contiguous()
-            K = frame.stereo.frame_K.detach().cpu().float().contiguous()
+            intrinsic = frame.stereo.frame_K.detach().cpu().float().contiguous()
             stereo_input = StereoFrameInput(
                 descriptor=descriptor,
                 left_image=left,
                 right_image=right,
-                intrinsic_pixel=K,
+                intrinsic_pixel=intrinsic,
                 baseline_m=float(frame.stereo.frame_baseline),
             )
             stereo_input.validate()
             observation = Observation(
                 descriptor=descriptor,
                 image=left,
-                intrinsic_pixel=K,
+                intrinsic_pixel=intrinsic,
             )
             observation.validate()
             yield descriptor, frame, stereo_input, observation
@@ -201,6 +216,7 @@ class MacvoPoseFrontend:
                 f"expected {expected_sequence_index}, got {descriptor.sequence_index}"
             )
         self._descriptors.append(descriptor)
+
         start = time.perf_counter()
         if self.stream is not None:
             with torch.cuda.stream(self.stream):
@@ -211,6 +227,7 @@ class MacvoPoseFrontend:
             if torch.cuda.is_available():
                 torch.cuda.current_stream().synchronize()
         self._last_run_sec = time.perf_counter() - start
+
         if self.config.pose_commit_policy == "end_of_sequence":
             return []
         committed_count = max(0, len(self._descriptors) - 1)
@@ -267,8 +284,9 @@ class MacvoPoseFrontend:
                     "source": "MAC-VO",
                     "coordinate_convention": "metric OpenCV c2w, first frame identity",
                     "commit_policy": self.config.pose_commit_policy,
-                    "one_frame_delay": self.config.pose_commit_policy
-                    == "one_frame_delayed",
+                    "one_frame_delay": (
+                        self.config.pose_commit_policy == "one_frame_delayed"
+                    ),
                     "need_interp": need_interp,
                 },
             )
