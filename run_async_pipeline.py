@@ -57,6 +57,20 @@ def nested_set(config: dict[str, Any], dotted: str, value: Any) -> None:
     current[keys[-1]] = value
 
 
+def normalize_override_value(dotted_key: str, raw: str) -> Any:
+    """Parse a CLI YAML value without turning backend mode ``null`` into None.
+
+    ``yaml.safe_load('null')`` correctly returns Python ``None`` according to the
+    YAML specification, but ``runtime.backend_mode=null`` is intended to select
+    the named NullValidationBackend. Accept both quoted and unquoted forms.
+    """
+
+    parsed = yaml.safe_load(raw)
+    if dotted_key == "runtime.backend_mode" and parsed is None:
+        return "null"
+    return parsed
+
+
 def resolve(config: dict[str, Any], script_root: Path) -> dict[str, Any]:
     value = copy.deepcopy(config)
     paths = value["paths"]
@@ -150,9 +164,14 @@ def build_system(config: dict[str, Any]):
         )
     )
 
-    if runtime["backend_mode"] == "null":
+    backend_mode = runtime.get("backend_mode")
+    if backend_mode is None:
+        # Be robust to YAML ``null`` in a config file as well as the CLI form.
+        backend_mode = "null"
+
+    if backend_mode == "null":
         backend = NullValidationBackend()
-    elif runtime["backend_mode"] == "incremental":
+    elif backend_mode == "incremental":
         optimization = BackendOptimizationConfig(**backend_cfg["optimization"])
         backend = StreamingIncrementalBackend(
             StreamingBackendConfig(
@@ -208,7 +227,7 @@ def build_system(config: dict[str, Any]):
             )
         )
     else:
-        raise ValueError(f"unknown backend_mode {runtime['backend_mode']}")
+        raise ValueError(f"unknown backend_mode {backend_mode}")
 
     pipeline_config = AsyncPipelineConfig(
         split_every=int(split["split_every"]),
@@ -253,7 +272,7 @@ def main() -> None:
         if "=" not in item:
             raise ValueError(f"invalid override {item!r}")
         key, raw = item.split("=", 1)
-        nested_set(config, key, yaml.safe_load(raw))
+        nested_set(config, key, normalize_override_value(key, raw))
     resolved = resolve(config, root)
     validate_paths(resolved)
     work_dir = Path(resolved["paths"]["work_dir"])
