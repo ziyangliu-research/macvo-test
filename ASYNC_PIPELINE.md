@@ -1,8 +1,8 @@
 # Asynchronous MAC-VO + ReSplat + Incremental 3DGS
 
 This branch replaces command-to-command subprocess chaining with persistent
-Python components and bounded in-memory queues. It keeps the current sibling
-repository layout:
+Python components and bounded in-memory queues. The sibling repository layout is
+kept unchanged:
 
 ```text
 Desktop/
@@ -11,10 +11,13 @@ Desktop/
 └── gaussian-splatting/   # GraphDECO renderer/model
 ```
 
-The existing serial scripts remain untouched. The asynchronous implementation is
-isolated on `feature/async-macvo-resplat-3dgs-v1` until the validation gates pass.
+The serial pipeline remains untouched. Development is isolated on:
 
-## Architecture
+```text
+feature/async-macvo-resplat-3dgs-v1
+```
+
+## Runtime architecture
 
 ```text
                          ┌──────────────────────────────┐
@@ -37,12 +40,11 @@ Decoded StereoFrame ─────┤ MAC-VO pose worker           │
                          └──────────────────────────────┘
 ```
 
-Three long-lived worker threads own the three GPU components. Initialization is
-coordinated once, sequentially, before streaming begins. Each component can use a
-dedicated CUDA stream. Input queues are bounded to provide backpressure and cap
-packet memory.
+The models are initialized once, sequentially, in their owning worker threads.
+Streaming then uses three bounded workers. Queue backpressure limits outstanding
+GPU packets.
 
-## Coordinate contract
+## Local-to-world packet contract
 
 ReSplat receives a canonical stereo rig:
 
@@ -51,69 +53,140 @@ left  c2w = I
 right c2w = fixed 0.25000006 m stereo transform
 ```
 
-It produces a packet in the current left-camera coordinate frame. Once MAC-VO
-commits `T_world_from_left`, the backend applies:
+After MAC-VO commits `T_world_from_left`, the backend applies:
 
 ```text
 mean_world = R_world_left @ mean_local + t_world_left
 cov_world  = R_world_left @ cov_local @ R_world_left^T
 ```
 
-The implementation stores ReSplat rotations in the model's actual `xyzw`
-convention, composes them in `xyzw`, and only then converts to GraphDECO's `wxyz`
-convention. Scale and opacity are invariant to a rigid transform. SH coefficients
-are intentionally left unchanged because the current `EncoderReSplat` direct-world
-path also leaves them unchanged.
+ReSplat quaternion fields are `xyzw`; GraphDECO uses `wxyz`. The conversion is
+explicit.
 
-This contract is plausible from the implementation but **must be validated on the
-actual checkpoint and sequence** before using asynchronous results in an experiment.
+The current ReSplat configuration uses `no_rotate_sh=true`. A packet inferred in
+the canonical frame therefore carries higher-order SH coefficients in the local
+left-camera basis. To preserve the appearance of the same packet after a rigid
+world transform, the async path rotates SH coefficients with ReSplat's own
+Wigner-D implementation:
 
-## Required validation gate
+```text
+SH_world = WignerD(R_world_left) @ SH_local
+```
 
-First generate or reuse the current serial MAC-VO pose file, then compare local
-inference + alignment against the existing direct-world ReSplat path:
+Scale and opacity are unchanged by the rigid transform.
+
+## Two different validation questions
+
+The original exact-equivalence test compares:
+
+```text
+ReSplat([I, baseline]) + explicit alignment
+```
+
+against:
+
+```text
+ReSplat([Twc, Twc @ baseline])
+```
+
+ReSplat is not guaranteed to be exactly SE(3)-equivariant because its point
+transformer constructs discrete KNN neighborhoods from world-space points.
+Therefore `validate_resplat_local_world_equivalence.py` is diagnostic only; its
+`passed=false` does not by itself reject local-first inference.
+
+The production gate is:
+
+```text
+validate_resplat_local_alignment_quality.py
+```
+
+It checks separately:
+
+1. The same local packet rendered before and after rigid alignment.
+2. Local-first packet GT PSNR/SSIM versus the current direct-world path.
+3. Exact learned-model equivariance as non-blocking diagnostic information.
+
+The required top-level result is:
+
+```json
+{
+  "alignment_passed": true,
+  "quality_passed": true,
+  "safe_for_async": true,
+  "passed": true
+}
+```
+
+`exact_equivariance_passed` may remain false.
+
+## Validation commands
 
 ```bash
 cd /home/shiyo/Desktop/MAC-VO
 
+git switch feature/async-macvo-resplat-3dgs-v1
+git pull origin feature/async-macvo-resplat-3dgs-v1
+```
+
+File-path preprocessing:
+
+```bash
 CUDA_VISIBLE_DEVICES=0 TORCH_COMPILE_DISABLE=1 \
-python validate_resplat_local_world_equivalence.py \
+python validate_resplat_local_alignment_quality.py \
   --resplat_repo /home/shiyo/Desktop/Resplat \
   --dataset_root /home/shiyo/Desktop/Datasets/tartanair_v2/House/Data_easy/P000 \
   --pose_npz /home/shiyo/Desktop/MAC-VO/outputs/macvo_stereo_resplat_P000_0_50/macvo_pose/macvo_pose_results.npz \
   --pose_indices 1,10,20,30,40,49 \
   --input_mode file_paths \
-  --output outputs/local_world_equivalence_file_paths.json
+  --output outputs/local_alignment_quality_file_paths.json
 ```
 
-Then repeat with the shared decoded-frame input used by the async system:
+Shared decoded tensors:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 TORCH_COMPILE_DISABLE=1 \
-python validate_resplat_local_world_equivalence.py \
+python validate_resplat_local_alignment_quality.py \
   --resplat_repo /home/shiyo/Desktop/Resplat \
   --dataset_root /home/shiyo/Desktop/Datasets/tartanair_v2/House/Data_easy/P000 \
   --pose_npz /home/shiyo/Desktop/MAC-VO/outputs/macvo_stereo_resplat_P000_0_50/macvo_pose/macvo_pose_results.npz \
   --pose_indices 1,10,20,30,40,49 \
   --input_mode shared_tensors \
-  --output outputs/local_world_equivalence_shared_tensors.json
+  --output outputs/local_alignment_quality_shared_tensors.json
 ```
 
-Do not continue to the full backend if either report contains `"passed": false`.
-
-## Dry run
+## Null-backend ordering test
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 TORCH_COMPILE_DISABLE=1 \
 python run_async_pipeline.py \
   --config Config/Pipeline/MACVO_ReSplat_Async_P000_0_50.yaml \
-  --dry_run
+  --set runtime.backend_mode=null \
+  --set paths.work_dir=outputs/macvo_resplat_async_null_P000_0_50
 ```
 
-## Full experiment configuration
+This validates:
 
-This retains per-packet evaluation, W&B, maintenance at local iteration 50, and
-100 local iterations per train packet:
+- persistent MAC-VO/ReSplat initialization;
+- parallel frontend task submission;
+- one-frame-delayed committed MAC-VO poses;
+- ordered pose/packet joining;
+- strict 40-train / 10-test split;
+- no ReSplat packet generation for test frames.
+
+## Full backend
+
+Compatibility-oriented run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 TORCH_COMPILE_DISABLE=1 \
+python run_async_pipeline.py \
+  --config Config/Pipeline/MACVO_ReSplat_Async_P000_0_50.yaml \
+  --set resplat_frontend.input_mode=file_paths \
+  --set resplat_frontend.handoff_mode=pinned_cpu \
+  --set paths.work_dir=outputs/macvo_resplat_async_compat_P000_0_50
+```
+
+Default in-memory run:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 TORCH_COMPILE_DISABLE=1 \
@@ -121,11 +194,7 @@ python run_async_pipeline.py \
   --config Config/Pipeline/MACVO_ReSplat_Async_P000_0_50.yaml
 ```
 
-## Throughput configuration
-
-This disables per-packet evaluation, W&B, periodic PLY writes, and JSON updates.
-The mapping algorithm remains packet reset + insertion + recent-K optimization +
-maintenance:
+Throughput run:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 TORCH_COMPILE_DISABLE=1 \
@@ -133,42 +202,14 @@ python run_async_pipeline.py \
   --config Config/Pipeline/MACVO_ReSplat_Async_Fast_P000_0_50.yaml
 ```
 
-## Important runtime decisions
+## Current implementation constraints
 
-- **No required intermediate hand-off files.** NPZ, PT, JSON, and PLY are optional
-  artifacts, not dependencies between stages.
-- **Single decoded stereo input.** MAC-VO's loader decodes each pair once. ReSplat
-  reuses the decoded tensors and preserves the legacy PIL resize/crop operation.
-- **One-frame pose commitment delay.** Under the current `AllKeyframe` and
-  `TwoFrame_PGO` configuration, frame `t-1` is emitted after frame `t` lets MAC-VO
-  write the preceding optimizer result back to the map.
-- **Strict split.** Test frames are never submitted to ReSplat and never inserted.
-  Their images and committed poses are retained only for evaluation.
-- **Invalid online poses.** A frame marked `need_interp` is skipped by default.
-  End-of-sequence interpolation from the serial exporter cannot be used causally.
-- **GPU packet hand-off.** The default configuration keeps the packet on GPU to
-  avoid GPU→CPU→GPU copies. Set `resplat_frontend.handoff_mode=pinned_cpu` if VRAM
-  pressure or allocator behavior is problematic.
-- **Explicit online spatial scale.** The previous GraphDECO `Scene` derived a
-  spatial learning-rate scale from the complete camera trajectory. An online
-  system cannot see future cameras, so `backend.spatial_lr_scale` is explicit and
-  must be checked against the serial baseline.
-
-## Validation sequence after the coordinate gate
-
-1. Run `runtime.backend_mode=null` over 0-50 to validate ordering and strict split.
-2. Run the full backend with `resplat_frontend.input_mode=file_paths`; compare final
-   metrics and per-packet curves with the current serial system.
-3. Switch to `shared_tensors`; isolate any preprocessing difference.
-4. Compare `pinned_cpu` and `gpu` hand-off for memory and throughput.
-5. Compare dedicated CUDA streams on/off. One-GPU concurrency is beneficial only
-   if it reduces measured end-to-end wall time without causing OOM or kernel
-   contention.
-6. Ablate `backend.spatial_lr_scale` if the async backend diverges from the serial
-   optimization trajectory.
-
-## Current status
-
-The code is compile-checked and the CPU tests cover ordered joining, strict split,
-SE(3) covariance alignment, and ReSplat-to-GraphDECO quaternion conventions. It
-has not been executed with the three CUDA repositories in this environment.
+- No NPZ/PT/JSON file is required as a stage hand-off.
+- MAC-VO commits frame `t-1` after processing `t`.
+- Frames marked `need_interp` are skipped online by default.
+- The online GraphDECO spatial learning-rate scale is explicit because future
+  cameras are not available when the backend starts.
+- Dedicated CUDA streams permit overlap but do not guarantee a speedup on one
+  GPU; wall time, queue wait, VRAM, and update latency must be measured.
+- The branch is not ready for merging until alignment validation, null-backend
+  ordering, and serial-versus-async metric comparisons pass on the target GPU.
