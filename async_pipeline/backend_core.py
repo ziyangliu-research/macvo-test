@@ -81,6 +81,7 @@ class StreamingIncrementalBackend(BackendEvaluationMixin):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.wall_start = time.perf_counter()
         self._init_wandb()
+        torch.cuda.reset_peak_memory_stats(self.device)
         self._initialized = True
 
     def _init_wandb(self) -> None:
@@ -99,6 +100,25 @@ class StreamingIncrementalBackend(BackendEvaluationMixin):
                 "optimization": self.config.optimization.__dict__,
             },
         )
+
+    def _gpu_memory_stats(self) -> dict[str, float]:
+        """Return packet-aligned PyTorch and device-level GPU memory statistics."""
+
+        gb = float(1024**3)
+        allocated = torch.cuda.memory_allocated(self.device)
+        reserved = torch.cuda.memory_reserved(self.device)
+        peak_allocated = torch.cuda.max_memory_allocated(self.device)
+        peak_reserved = torch.cuda.max_memory_reserved(self.device)
+        free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
+        return {
+            "gpu_memory_allocated_gb": float(allocated) / gb,
+            "gpu_memory_reserved_gb": float(reserved) / gb,
+            "gpu_peak_memory_allocated_gb": float(peak_allocated) / gb,
+            "gpu_peak_memory_reserved_gb": float(peak_reserved) / gb,
+            "gpu_free_memory_gb": float(free_bytes) / gb,
+            "gpu_total_memory_gb": float(total_bytes) / gb,
+            "gpu_used_global_gb": float(total_bytes - free_bytes) / gb,
+        }
 
     def process(self, update: BackendUpdate) -> None:
         self.initialize()
@@ -178,6 +198,7 @@ class StreamingIncrementalBackend(BackendEvaluationMixin):
             "new_packet_opacity_reset": reset_stats,
             "maintenance": maintenance_event,
         }
+        timing.update(self._gpu_memory_stats())
         self.timing_log.append(timing)
         if self.config.write_runtime_artifacts:
             self._save_json("timing_log.json", self.timing_log)
