@@ -93,6 +93,20 @@ class BackendEvaluationMixin:
                 "timing/join_wait_sec": timing["join_wait_sec"],
                 "scene/num_gaussians": timing["num_gaussians"],
                 "stream/train_packet_count": timing["train_packet_count"],
+                "resource/gpu_memory_allocated_gb": timing[
+                    "gpu_memory_allocated_gb"
+                ],
+                "resource/gpu_memory_reserved_gb": timing[
+                    "gpu_memory_reserved_gb"
+                ],
+                "resource/gpu_peak_memory_allocated_gb": timing[
+                    "gpu_peak_memory_allocated_gb"
+                ],
+                "resource/gpu_peak_memory_reserved_gb": timing[
+                    "gpu_peak_memory_reserved_gb"
+                ],
+                "resource/gpu_free_memory_gb": timing["gpu_free_memory_gb"],
+                "resource/gpu_used_global_gb": timing["gpu_used_global_gb"],
             },
             step=self.global_iteration,
         )
@@ -164,6 +178,7 @@ class BackendEvaluationMixin:
             "evaluation_enabled": self.config.evaluation_enabled,
             "write_runtime_artifacts": self.config.write_runtime_artifacts,
             "final_metrics": final_metrics,
+            "gpu_memory": self._gpu_memory_stats(),
             "wall_time_sec": time.perf_counter() - self.wall_start,
         }
         self._save_json("incremental_backend_summary.json", summary)
