@@ -105,12 +105,25 @@ class StreamingIncrementalBackend(_BaseStreamingBackend):
                 if pieces:
                     metric_text = " | " + " ".join(pieces)
 
+        resource_text = ""
+        if self.timing_log:
+            latest_timing = self.timing_log[-1]
+            if latest_timing.get("frame_index") == update.descriptor.frame_index:
+                resource_text = (
+                    " | VRAM="
+                    f"{float(latest_timing['gpu_memory_allocated_gb']):.2f}GB "
+                    f"reserved={float(latest_timing['gpu_memory_reserved_gb']):.2f}GB "
+                    f"peak={float(latest_timing['gpu_peak_memory_allocated_gb']):.2f}GB "
+                    f"free={float(latest_timing['gpu_free_memory_gb']):.2f}GB"
+                )
+
         print(
             f"[backend] packet {completed:02d}/{expected_packets:02d} "
             f"frame={update.descriptor.frame_index:04d} "
             f"iter={self.global_iteration}/{configured_total_iterations} "
             f"G={num_gaussians:,} "
             f"last={update_sec:.2f}s elapsed={elapsed:.1f}s ETA={eta:.1f}s"
-            f"{metric_text}",
+            f"{metric_text}"
+            f"{resource_text}",
             flush=True,
         )
