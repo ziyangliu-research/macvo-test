@@ -77,6 +77,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Save the exact left/right tensors yielded by pose_frontend.iter_frames().",
     )
+    parser.add_argument(
+        "--force_default_resplat_stream",
+        action="store_true",
+        help=(
+            "Diagnostic only: replace ResplatPacketGenerator's dedicated CUDA stream "
+            "with the current/default stream. This makes the CPU->GPU batch copy and "
+            "encoder execution stream-ordered, matching the legacy ZipMap+ReSplat path."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -154,6 +163,12 @@ def main() -> None:
     init_start = time.perf_counter()
     pose_frontend.initialize()
     packet_generator.initialize()
+    if args.force_default_resplat_stream:
+        # ResplatPacketGenerator normally copies batch tensors on the current stream,
+        # then immediately executes the encoder on a separate stream. The legacy
+        # ZipMap+ReSplat path performs both on the same stream. Reusing the current
+        # stream here is a zero-core-code diagnostic for a possible stream-order race.
+        packet_generator.stream = torch.cuda.current_stream(packet_generator.device)
     initialization_sec = time.perf_counter() - init_start
 
     resplat_repo = Path(resolved["paths"]["resplat_repo"])
@@ -257,6 +272,7 @@ def main() -> None:
                 "resplat_far": float(packet_generator.far),
                 "resplat_refine_steps": int(packet_generator.config.refine_steps),
                 "resplat_input_mode": str(packet_generator.config.input_mode),
+                "force_default_resplat_stream": bool(args.force_default_resplat_stream),
             }
             (output_dir / "first_frame_debug.json").write_text(
                 json.dumps(first_debug, indent=2), encoding="utf-8"
@@ -288,6 +304,7 @@ def main() -> None:
         "seed": seed,
         "config": str(config_path),
         "include_test_frames": bool(args.include_test_frames),
+        "force_default_resplat_stream": bool(args.force_default_resplat_stream),
         "num_evaluated_frames": len(rows),
         "num_skipped_test_frames": skipped_test,
         "average_psnr": float(np.mean([r["psnr"] for r in rows])),
