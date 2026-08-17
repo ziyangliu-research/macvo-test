@@ -382,7 +382,16 @@ class ResplatPacketGenerator:
         if keep_gpu_packet is None:
             keep_gpu_packet = self.config.handoff_mode == "gpu"
         batch_cpu = self._make_batch(frame_input, T_left)
+
+        # The host-to-device copies below are enqueued on the caller's current CUDA
+        # stream. ReSplat runs on its own persistent stream, so that stream must wait
+        # for the per-batch copies on every inference call. Waiting only once during
+        # initialize() is insufficient and can let the encoder consume incomplete
+        # input tensors, severely degrading the generated Gaussians.
+        producer_stream = torch.cuda.current_stream(self.device)
         batch = _tensor_to_device(batch_cpu, self.device)
+        self.stream.wait_stream(producer_stream)
+
         start = time.perf_counter()
         with torch.cuda.stream(self.stream):
             batch = self.model.data_shim(batch)
