@@ -1,0 +1,9 @@
+type: TartanAir_NoIMU
+name: TartanAirV1_Challenge_SH007
+
+args:
+  root: /home/shiyo/Desktop/Datasets/TartanAir_Stereo_Challenge/stereo/SH007
+  compressed: true
+  gtDepth: false
+  gtPose: false
+  gtFlow: false
