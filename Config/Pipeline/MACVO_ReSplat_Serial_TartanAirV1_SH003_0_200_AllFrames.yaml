@@ -21,7 +21,7 @@ paths:
   odom_config: Config/Experiment/MACVO/MACVO_Performant.yaml
   data_config: Config/Sequence/TartanAirV1_Challenge_SH003.yaml
   resplat_checkpoint: null
-  work_dir: outputs/macvo_resplat_SH003_0_200_fixed_stream
+  work_dir: outputs/macvo_resplat_SH003_0_200_full_fov
 
 sequence:
   start_index: 0
@@ -75,7 +75,7 @@ runtime:
   pin_packet_memory: true
 
 backend:
-  output_name: incremental_SH003_0_200_allframes_i100_dp50_fixed_stream
+  output_name: incremental_SH003_0_200_allframes_full_fov_i100_dp50
   device: cuda:0
   sh_degree: 3
   local_map_size: 10
@@ -102,7 +102,7 @@ backend:
 
   wandb_mode: online
   wandb_project: macvo-resplat-tartanair-v1-comparison
-  wandb_run_name: SH003_0_200_allframes_i100_dp50_fixed_stream
+  wandb_run_name: SH003_0_200_allframes_full_fov_i100_dp50
   wandb_log_interval: 100
   dedicated_cuda_stream: false
   invalid_pose_policy: skip
