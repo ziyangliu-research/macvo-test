@@ -39,6 +39,8 @@ camera:
   right_pattern: "{index:06d}_right.png"
 
 pose_frontend:
+  # macvo = normal pipeline; gt = exact TartanAir GT-pose ablation.
+  source: macvo
   commit_policy: one_frame_delayed
   dedicated_cuda_stream: false
 
