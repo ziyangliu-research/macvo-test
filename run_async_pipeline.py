@@ -93,6 +93,11 @@ def resolve(config: dict[str, Any], script_root: Path) -> dict[str, Any]:
         paths["resplat_checkpoint"] = str(
             absolute(checkpoint, Path(paths["resplat_repo"]))
         )
+    evaluation = value.get("evaluation")
+    if isinstance(evaluation, dict) and evaluation.get("gt_pose_file"):
+        evaluation["gt_pose_file"] = str(
+            absolute(evaluation["gt_pose_file"], macvo_repo)
+        )
     return value
 
 
@@ -125,9 +130,11 @@ def build_system(config: dict[str, Any]):
     backend_cfg = config["backend"]
     split = config["split"]
     runtime = config["runtime"]
+    evaluation = config.get("evaluation") or {}
     work_dir = Path(paths["work_dir"])
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    gt_pose_value = evaluation.get("gt_pose_file")
     pose_frontend = MacvoPoseFrontend(
         MacvoRuntimeConfig(
             repo=Path(paths["macvo_repo"]),
@@ -142,6 +149,8 @@ def build_system(config: dict[str, Any]):
             preload=bool(runtime["preload"]),
             pose_commit_policy=pose_cfg["commit_policy"],
             dedicated_cuda_stream=bool(pose_cfg["dedicated_cuda_stream"]),
+            pose_source=str(pose_cfg.get("source", "macvo")),
+            gt_pose_file=(None if not gt_pose_value else Path(str(gt_pose_value))),
         )
     )
     packet_generator = ResplatPacketGenerator(
