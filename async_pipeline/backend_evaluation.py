@@ -74,6 +74,11 @@ class BackendEvaluationMixin:
             values: dict[str, float] = {
                 "eval/num_gaussians": float(entry["num_gaussians"]),
                 "eval/frame_index": float(update.descriptor.frame_index),
+                "eval/sequence_index": float(update.descriptor.sequence_index),
+                "eval/train_packet_count": float(self.train_packet_count),
+                "eval/train_num_views": float(entry["train_inserted"].get("num_views", 0)),
+                "eval/test_num_views": float(entry["test_seen"].get("num_views", 0)),
+                "eval/active_local_num_views": float(entry["active_local_map"].get("num_views", 0)),
             }
             for split in ("train_inserted", "active_local_map", "test_seen"):
                 metrics = entry[split]
