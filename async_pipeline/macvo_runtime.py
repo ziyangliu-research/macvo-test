@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+import numpy as np
 import torch
 
 from .contracts import (
@@ -65,6 +66,8 @@ class MacvoRuntimeConfig:
     preload: bool = False
     pose_commit_policy: str = "one_frame_delayed"
     dedicated_cuda_stream: bool = True
+    pose_source: str = "macvo"
+    gt_pose_file: Optional[Path] = None
 
     def __post_init__(self) -> None:
         if self.start_index < 0 or self.end_index <= self.start_index:
@@ -75,10 +78,22 @@ class MacvoRuntimeConfig:
             raise ValueError(
                 "pose_commit_policy must be one_frame_delayed or end_of_sequence"
             )
+        if self.pose_source not in {"macvo", "gt"}:
+            raise ValueError("pose_source must be macvo or gt")
+        if self.pose_source == "gt" and self.gt_pose_file is None:
+            raise ValueError("gt pose source requires gt_pose_file")
 
 
 class MacvoPoseFrontend:
-    """Persistent in-process MAC-VO runtime with committed streaming poses."""
+    """Frame loader plus either MAC-VO or exact TartanAir GT pose frontend.
+
+    ``pose_source='macvo'`` preserves the normal online MAC-VO path.
+    ``pose_source='gt'`` is an ablation mode: the same sequence loader and image
+    preprocessing are retained, but MAC-VO is not constructed or run. Instead,
+    poses are read from the configured TartanAir tx ty tz qx qy qz qw file and
+    converted with the exact same TartanAir->OpenCV and first-frame-relative
+    convention used by ``run_async_pipeline_metrics.py``.
+    """
 
     def __init__(self, config: MacvoRuntimeConfig) -> None:
         self.config = config
@@ -91,29 +106,21 @@ class MacvoPoseFrontend:
         self._last_run_sec = 0.0
         self._terminated = False
         self.stream: Optional[torch.cuda.Stream] = None
+        self._initialized = False
+        self._gt_rows: Optional[np.ndarray] = None
 
     def initialize(self) -> None:
-        if self.system is not None:
+        if self._initialized:
             return
         if str(self.repo) not in sys.path:
             sys.path.insert(0, str(self.repo))
 
         from DataLoader import SequenceBase, StereoFrame, smart_transform
-        from Odometry.MACVO import MACVO
         from Utility.Config import load_config
 
         odom_cfg, _ = load_config(self.config.odom_config.expanduser().resolve())
         data_cfg, _ = load_config(self.config.data_config.expanduser().resolve())
 
-        if not hasattr(odom_cfg, "Odometry"):
-            raise ValueError(
-                f"MAC-VO odometry config has no Odometry section: {self.config.odom_config}"
-            )
-        if not hasattr(odom_cfg.Odometry, "frontend"):
-            raise ValueError(
-                "MAC-VO Odometry section has no frontend entry; the complete root "
-                "experiment config must be supplied"
-            )
         if not hasattr(odom_cfg, "Preprocess"):
             raise ValueError(
                 f"MAC-VO odometry config has no Preprocess section: {self.config.odom_config}"
@@ -127,8 +134,43 @@ class MacvoPoseFrontend:
         sequence = smart_transform(sequence, odom_cfg.Preprocess)
         if self.config.preload:
             sequence = sequence.preload()
-
         self.sequence = sequence
+
+        if self.config.pose_source == "gt":
+            assert self.config.gt_pose_file is not None
+            gt_path = self.config.gt_pose_file.expanduser().resolve()
+            if not gt_path.is_file():
+                raise FileNotFoundError(f"GT pose file not found: {gt_path}")
+            rows = np.loadtxt(gt_path, dtype=np.float64)
+            if rows.ndim == 1:
+                rows = rows.reshape(1, -1)
+            if rows.ndim != 2 or rows.shape[1] < 7:
+                raise ValueError(
+                    f"GT pose file must contain tx ty tz qx qy qz qw rows, got {rows.shape}"
+                )
+            if self.config.end_index > rows.shape[0]:
+                raise IndexError(
+                    f"requested frames [{self.config.start_index},{self.config.end_index}) "
+                    f"outside GT pose file with {rows.shape[0]} rows"
+                )
+            self._gt_rows = rows
+            first_absolute = self._gt_absolute_pose(self.config.start_index)
+            self._T0_inv = torch.linalg.inv(first_absolute)
+            self._initialized = True
+            return
+
+        if not hasattr(odom_cfg, "Odometry"):
+            raise ValueError(
+                f"MAC-VO odometry config has no Odometry section: {self.config.odom_config}"
+            )
+        if not hasattr(odom_cfg.Odometry, "frontend"):
+            raise ValueError(
+                "MAC-VO Odometry section has no frontend entry; the complete root "
+                "experiment config must be supplied"
+            )
+
+        from Odometry.MACVO import MACVO
+
         # MACVO.from_config expects the complete root namespace and internally
         # reads cfg.Odometry. The previous implementation wrapped the complete
         # dictionary inside another Odometry key, producing cfg.Odometry.Odometry.
@@ -138,6 +180,7 @@ class MacvoPoseFrontend:
             current = torch.cuda.current_stream()
             self.stream = torch.cuda.Stream()
             self.stream.wait_stream(current)
+        self._initialized = True
 
     def descriptors(self) -> list[FrameDescriptor]:
         self.initialize()
@@ -208,15 +251,34 @@ class MacvoPoseFrontend:
         self.initialize()
         if self._terminated:
             raise RuntimeError("cannot process frames after terminate")
-        assert self.system is not None
         expected_sequence_index = len(self._descriptors)
         if descriptor.sequence_index != expected_sequence_index:
             raise ValueError(
-                "MAC-VO frames must be submitted in sequence order; "
+                "pose frames must be submitted in sequence order; "
                 f"expected {expected_sequence_index}, got {descriptor.sequence_index}"
             )
         self._descriptors.append(descriptor)
 
+        if self.config.pose_source == "gt":
+            estimate = PoseEstimate(
+                descriptor=descriptor,
+                T_world_from_left=self._gt_relative_pose(descriptor.frame_index),
+                valid=True,
+                committed=True,
+                revision=0,
+                latency_sec=0.0,
+                metadata={
+                    "source": "TartanAir-GT",
+                    "coordinate_convention": "metric OpenCV c2w, first selected frame identity",
+                    "commit_policy": "immediate_gt_ablation",
+                    "one_frame_delay": False,
+                    "need_interp": False,
+                },
+            )
+            estimate.validate()
+            return [estimate]
+
+        assert self.system is not None
         start = time.perf_counter()
         if self.stream is not None:
             with torch.cuda.stream(self.stream):
@@ -237,6 +299,10 @@ class MacvoPoseFrontend:
         if self._terminated:
             return []
         self.initialize()
+        if self.config.pose_source == "gt":
+            self._terminated = True
+            return []
+
         assert self.system is not None
         if self.stream is not None:
             with torch.cuda.stream(self.stream):
@@ -248,6 +314,24 @@ class MacvoPoseFrontend:
                 torch.cuda.current_stream().synchronize()
         self._terminated = True
         return self._emit_until(len(self._descriptors))
+
+    def _gt_absolute_pose(self, frame_index: int) -> torch.Tensor:
+        if self._gt_rows is None:
+            raise RuntimeError("GT poses are not initialized")
+        if frame_index < 0 or frame_index >= self._gt_rows.shape[0]:
+            raise IndexError(
+                f"GT frame index {frame_index} outside [0,{self._gt_rows.shape[0]})"
+            )
+        pose = _pose7_xyzw_to_matrix(
+            torch.from_numpy(self._gt_rows[frame_index, :7].copy())
+        )
+        return pose @ _tartan_from_cv(dtype=torch.float64)
+
+    def _gt_relative_pose(self, frame_index: int) -> torch.Tensor:
+        if self._T0_inv is None:
+            first = self._gt_absolute_pose(self.config.start_index)
+            self._T0_inv = torch.linalg.inv(first)
+        return (self._T0_inv @ self._gt_absolute_pose(frame_index)).float()
 
     def _body_pose7(self, index: int) -> torch.Tensor:
         import pypose as pp
@@ -266,6 +350,7 @@ class MacvoPoseFrontend:
 
     def _emit_until(self, count: int) -> list[PoseEstimate]:
         output: list[PoseEstimate] = []
+        assert self.system is not None
         graph = self.system.graph
         while self._next_emit < count:
             index = self._next_emit
