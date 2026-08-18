@@ -4,8 +4,14 @@ version: 1
 # All 200 frames are train/insert frames. The command uses
 # run_pipeline_execution_benchmark_repro.py --mode serial.
 #
-# ReSplat uses the validated tartanair_p000_ft preprocessing unchanged
-# (320x320) and the corrected per-batch CUDA stream dependency in
+# SH003 is natively 640x480 (4:3). ReSplat therefore uses 320x240 rather than
+# its square 320x320 default so preprocessing is an aspect-preserving 0.5x
+# resize with NO center crop. MAC-VO and the GraphDECO backend keep the native
+# 640x480 camera. Their pixel intrinsics differ by exactly 2x, but the camera
+# rays / full field of view are identical. This is the canonical SH003 camera
+# contract for full-FOV experiments.
+#
+# ReSplat also uses the corrected per-batch CUDA stream dependency in
 # async_pipeline/resplat_runtime.py.
 
 paths:
@@ -42,8 +48,10 @@ resplat_frontend:
   refine_steps: 0
   refine_use_target: false
   deterministic: false
-  # Keep the validated ReSplat experiment default: dataset.image_shape=[320,320].
-  overrides: []
+  # Preserve SH003's native 4:3 full FoV: 640x480 -> 320x240, no center crop.
+  # Effective ReSplat pixel K becomes fx=fy=160, cx=160, cy=120.
+  overrides:
+    - dataset.image_shape=[240,320]
   input_mode: shared_tensors
   handoff_mode: pinned_cpu
   strict_validation: false
