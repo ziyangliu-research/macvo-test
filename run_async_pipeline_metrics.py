@@ -125,14 +125,38 @@ def trajectory_metric(
     }
 
 
+def resolve_gt_pose_path(resolved: dict[str, Any]) -> Path:
+    """Resolve GT poses for both TartanAir V2 and Stereo Challenge layouts.
+
+    TartanAir V2 stores ``pose_lcam_front.txt`` inside each sequence directory.
+    Stereo Challenge sequences keep GT separately under ``ground_truth/stereo_gt``;
+    those configs provide ``evaluation.gt_pose_file`` explicitly.
+    """
+
+    evaluation = resolved.get("evaluation") or {}
+    explicit = evaluation.get("gt_pose_file")
+    if explicit:
+        pose_path = Path(str(explicit)).expanduser()
+        if not pose_path.is_absolute():
+            pose_path = (Path(resolved["paths"]["macvo_repo"]) / pose_path).resolve()
+        else:
+            pose_path = pose_path.resolve()
+    else:
+        data_config_path = Path(resolved["paths"]["data_config"])
+        data_config = yaml.safe_load(data_config_path.read_text(encoding="utf-8"))
+        dataset_root = Path(data_config["args"]["root"]).expanduser().resolve()
+        pose_path = dataset_root / "pose_lcam_front.txt"
+
+    if not pose_path.is_file():
+        raise FileNotFoundError(f"GT pose file not found: {pose_path}")
+    return pose_path
+
+
 def load_gt_trajectory(
     resolved: dict[str, Any],
     count: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    data_config_path = Path(resolved["paths"]["data_config"])
-    data_config = yaml.safe_load(data_config_path.read_text(encoding="utf-8"))
-    dataset_root = Path(data_config["args"]["root"]).expanduser().resolve()
-    pose_path = dataset_root / "pose_lcam_front.txt"
+    pose_path = resolve_gt_pose_path(resolved)
     rows = np.loadtxt(pose_path, dtype=np.float64)
 
     start = int(resolved["sequence"]["start_index"])
@@ -140,7 +164,8 @@ def load_gt_trajectory(
     frame_indices = np.arange(start, min(end, start + count), dtype=np.int64)
     if frame_indices.size == 0 or int(frame_indices[-1]) >= rows.shape[0]:
         raise IndexError(
-            f"requested GT rows [{start},{end}) outside pose file with {rows.shape[0]} rows"
+            f"requested GT rows [{start},{end}) outside pose file {pose_path} "
+            f"with {rows.shape[0]} rows"
         )
 
     tartan_from_cv = _tartan_from_cv(dtype=torch.float64)
@@ -198,6 +223,7 @@ def evaluate_pose(runner, resolved: dict[str, Any], num_frames: int, output: Pat
 
     report = {
         "coordinate_convention": "metric OpenCV c2w, first frame identity",
+        "gt_pose_file": str(resolve_gt_pose_path(resolved)),
         "num_requested_poses": int(predicted_all.shape[0]),
         "num_valid_poses": int(predicted.shape[0]),
         "num_skipped_need_interp": int((~valid_mask).sum()),
