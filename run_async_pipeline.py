@@ -58,12 +58,19 @@ def nested_set(config: dict[str, Any], dotted: str, value: Any) -> None:
 
 
 def normalize_override_value(dotted_key: str, raw: str) -> Any:
-    """Parse a CLI YAML value without turning backend mode ``null`` into None.
+    """Parse CLI YAML values while preserving named string modes.
 
-    ``yaml.safe_load('null')`` correctly returns Python ``None`` according to the
-    YAML specification, but ``runtime.backend_mode=null`` is intended to select
-    the named NullValidationBackend. Accept both quoted and unquoted forms.
+    YAML 1.1-style parsing treats unquoted ``off`` as boolean ``False`` and
+    ``null`` as ``None``. In this pipeline those tokens are legitimate string
+    values for backend configuration, so preserve them before generic parsing.
     """
+
+    stripped = raw.strip()
+    lowered = stripped.lower()
+    if dotted_key == "backend.maintenance_mode" and lowered in {"off", "standard"}:
+        return lowered
+    if dotted_key == "runtime.backend_mode" and lowered == "null":
+        return "null"
 
     parsed = yaml.safe_load(raw)
     if dotted_key == "runtime.backend_mode" and parsed is None:
