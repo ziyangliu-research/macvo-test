@@ -101,7 +101,16 @@ def _install_maintenance_ablation(mode: str) -> None:
         elif mode == "prune_only":
             # Match the pruning half of GraphDECO densify_and_prune(), but on
             # the current pre-densification Gaussian set.
-            opacity_mask = (g.get_opacity < self.config.maintenance_min_opacity).squeeze()
+            #
+            # prune_points() also slices GraphDECO's temporary tmp_radii buffer,
+            # so standard densify_and_prune() always creates it before pruning.
+            # Even though prune_only skips clone/split, we must provide the same
+            # temporary state to keep prune_points() internally consistent.
+            g.tmp_radii = radii
+
+            opacity_mask = (
+                g.get_opacity < self.config.maintenance_min_opacity
+            ).squeeze()
             prune_mask = opacity_mask.clone()
             opacity_pruned = int(opacity_mask.sum().item())
             screen_or_world_pruned = 0
@@ -117,6 +126,9 @@ def _install_maintenance_ablation(mode: str) -> None:
 
             total_pruned = int(prune_mask.sum().item())
             g.prune_points(prune_mask)
+
+            # Match GraphDECO densify_and_prune() cleanup after prune_points().
+            g.tmp_radii = None
             torch.cuda.empty_cache()
 
             details.update(
