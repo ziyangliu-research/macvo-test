@@ -11,6 +11,15 @@ expected packet quality.
 Async scheduling remains available for future investigation, but this wrapper
 only applies the stream override when ``--mode serial`` is requested.
 
+Optional fixed-budget historical replay can be enabled with
+``PIPELINE_HISTORICAL_REPLAY_FRACTION`` (for example ``0.2``). The experiment
+preserves the original recent-only optimization through the configured
+maintenance iteration. Historical cameras are sampled only after maintenance,
+so a 100-iteration packet with fraction 0.2 executes 50 recent iterations before
+maintenance and then 30 recent + 20 historical iterations afterwards. This
+keeps the total optimization budget at 100 and leaves the pre-maintenance path
+as close as possible to the baseline.
+
 Optional root-cause diagnostics can be enabled with
 ``PIPELINE_ROOT_CAUSE_DIAGNOSTICS=1``. They do not change the optimization
 algorithm. At selected train-packet ordinals they render frozen historical
@@ -88,6 +97,194 @@ def _parse_positive_int_list(raw: str) -> tuple[int, ...]:
     return tuple(sorted(set(values)))
 
 
+def _install_historical_replay() -> None:
+    """Install a fixed-budget historical-camera replay ablation.
+
+    The original recent-only camera sampling is preserved up to and including
+    the configured maintenance iteration. Replay is inserted only after that
+    point, which keeps append, the first optimization half, densification
+    statistics, and the maintenance event directly comparable to the baseline.
+    """
+
+    from async_pipeline.backend_core import StreamingIncrementalBackend
+
+    original_optimize = StreamingIncrementalBackend._optimize_active_map
+    if getattr(original_optimize, "_historical_replay_patch", False):
+        return
+
+    replay_fraction = float(os.environ.get("PIPELINE_HISTORICAL_REPLAY_FRACTION", "0"))
+    if not 0.0 < replay_fraction < 1.0:
+        raise ValueError(
+            "PIPELINE_HISTORICAL_REPLAY_FRACTION must be strictly between 0 and 1"
+        )
+
+    def optimize_with_historical_replay(
+        self: StreamingIncrementalBackend,
+        update,
+        active_cameras,
+    ):
+        from utils.loss_utils import l1_loss, ssim
+
+        maintenance_event = None
+        recent_pool = list(active_cameras)
+        recent_stack = list(recent_pool)
+        historical_pool = list(self.train_cameras[: -self.config.local_map_size])
+        historical_stack = list(historical_pool)
+
+        total_iterations = int(self.config.iterations_per_packet)
+        if self.config.maintenance_mode == "standard":
+            replay_start = int(self.config.maintenance_after_local_iteration) + 1
+        else:
+            replay_start = 1
+        replay_window = max(0, total_iterations - replay_start + 1)
+
+        target_history = (
+            min(
+                replay_window,
+                int(round(total_iterations * replay_fraction)),
+            )
+            if historical_pool
+            else 0
+        )
+        recent_count = 0
+        history_count = 0
+
+        for local_iteration in range(1, total_iterations + 1):
+            self.global_iteration += 1
+            self.gaussians.update_learning_rate(self.global_iteration)
+
+            use_history = False
+            if target_history > 0 and local_iteration >= replay_start:
+                replay_index = local_iteration - replay_start + 1
+                before = ((replay_index - 1) * target_history) // replay_window
+                after = (replay_index * target_history) // replay_window
+                use_history = after > before
+
+            if use_history:
+                if not historical_stack:
+                    historical_stack = list(historical_pool)
+                camera = historical_stack.pop(random.randrange(len(historical_stack)))
+                history_count += 1
+                supervision_source = "history"
+            else:
+                if not recent_stack:
+                    recent_stack = list(recent_pool)
+                camera = recent_stack.pop(random.randrange(len(recent_stack)))
+                recent_count += 1
+                supervision_source = "recent"
+
+            background = (
+                torch.rand(3, device=self.device)
+                if self.opt.random_background
+                else self.background
+            )
+            render_pkg = self.render(
+                camera,
+                self.gaussians,
+                self.pipe,
+                background,
+                use_trained_exp=False,
+                separate_sh=False,
+            )
+            image = render_pkg["render"]
+            gt = camera.original_image
+            if camera.alpha_mask is not None:
+                image = image * camera.alpha_mask
+            ll1 = l1_loss(image, gt)
+            ssim_value = ssim(image, gt)
+            loss = (
+                (1.0 - self.opt.lambda_dssim) * ll1
+                + self.opt.lambda_dssim * (1.0 - ssim_value)
+            )
+            loss.backward()
+
+            with torch.no_grad():
+                collecting = (
+                    self.config.maintenance_mode == "standard"
+                    and local_iteration
+                    <= self.config.maintenance_after_local_iteration
+                )
+                if collecting:
+                    indices = self._visibility_indices(
+                        render_pkg["visibility_filter"],
+                        int(self.gaussians.get_xyz.shape[0]),
+                    )
+                    radii = render_pkg["radii"]
+                    if indices.numel() > 0:
+                        self.gaussians.max_radii2D[indices] = torch.maximum(
+                            self.gaussians.max_radii2D[indices], radii[indices]
+                        )
+                        self.gaussians.add_densification_stats(
+                            render_pkg["viewspace_points"], indices
+                        )
+
+                self.gaussians.optimizer.step()
+                self.gaussians.optimizer.zero_grad(set_to_none=True)
+
+                if (
+                    self.config.maintenance_mode == "standard"
+                    and local_iteration
+                    == self.config.maintenance_after_local_iteration
+                ):
+                    maintenance_event = self._run_maintenance(
+                        update,
+                        local_iteration,
+                        render_pkg["radii"],
+                    )
+
+                if (
+                    self.wandb_run is not None
+                    and self.global_iteration % self.config.wandb_log_interval == 0
+                ):
+                    self.wandb_run.log(
+                        {
+                            "train/loss": float(loss.item()),
+                            "train/l1": float(ll1.item()),
+                            "train/ssim": float(ssim_value.item()),
+                            "scene/num_gaussians": int(
+                                self.gaussians.get_xyz.shape[0]
+                            ),
+                            "stream/frame_index": update.descriptor.frame_index,
+                            "stream/train_packet_count": self.train_packet_count,
+                            "replay/is_history_iteration": int(
+                                supervision_source == "history"
+                            ),
+                        },
+                        step=self.global_iteration,
+                    )
+
+        replay_stats = {
+            "enabled": bool(historical_pool),
+            "requested_fraction": replay_fraction,
+            "historical_pool_size": len(historical_pool),
+            "recent_pool_size": len(recent_pool),
+            "replay_start_local_iteration": replay_start,
+            "recent_iterations": recent_count,
+            "historical_iterations": history_count,
+            "total_iterations": total_iterations,
+        }
+        setattr(self, "_historical_replay_last_stats", replay_stats)
+        print(
+            "[historical replay] "
+            f"packet={self.train_packet_count} "
+            f"frame={update.descriptor.frame_index} "
+            f"recent={recent_count} history={history_count} "
+            f"history_pool={len(historical_pool)} "
+            f"start_iter={replay_start}",
+            flush=True,
+        )
+        return maintenance_event
+
+    optimize_with_historical_replay._historical_replay_patch = True  # type: ignore[attr-defined]
+    StreamingIncrementalBackend._optimize_active_map = optimize_with_historical_replay
+
+    print(
+        "[repro] fixed-budget historical replay enabled: "
+        f"fraction={replay_fraction}; pre-maintenance optimization remains recent-only",
+        flush=True,
+    )
+
+
 def _install_root_cause_diagnostics() -> None:
     """Instrument the incremental backend without changing its training policy.
 
@@ -146,10 +343,6 @@ def _install_root_cause_diagnostics() -> None:
             "all_history": self._evaluate(frozen_history),
         }
 
-        # The exact camera set used by the optimizer becomes available only after
-        # the new camera is inserted into train_cameras. It is therefore logged
-        # for S2-S4 as supplementary information, while the three frozen-history
-        # sets above remain directly comparable across all five stages.
         optimization_active = context.get("optimization_active_cameras")
         if optimization_active is not None and stage_order >= 2:
             metrics["optimization_active"] = self._evaluate(optimization_active)
@@ -167,6 +360,11 @@ def _install_root_cause_diagnostics() -> None:
             "local_map_size": int(self.config.local_map_size),
             "metrics": metrics,
         }
+        if stage == "S4_post_optimization":
+            replay_stats = getattr(self, "_historical_replay_last_stats", None)
+            if replay_stats is not None:
+                entry["historical_replay"] = replay_stats
+
         log = _diagnostic_log(self)
         log.append(entry)
         context.setdefault("log_indices", []).append(len(log) - 1)
@@ -198,8 +396,6 @@ def _install_root_cause_diagnostics() -> None:
         packet_ordinal = int(self.train_packet_count) + 1
         enabled = packet_ordinal in packet_ordinals
         if enabled:
-            # Freeze only cameras that were already part of the map before this
-            # packet arrived. This makes S0->S1 a pure append/interference test.
             context = {
                 "packet_ordinal": packet_ordinal,
                 "frame_index": None,
@@ -243,8 +439,6 @@ def _install_root_cause_diagnostics() -> None:
         if context:
             context["frame_index"] = int(update.descriptor.frame_index)
             context["optimization_active_cameras"] = list(active_cameras)
-            # Backfill S0/S1 with the frame index, which is not visible inside
-            # _append_gaussians itself.
             log = _diagnostic_log(self)
             for index in context.get("log_indices", []):
                 log[index]["frame_index"] = int(update.descriptor.frame_index)
@@ -285,6 +479,10 @@ def main() -> None:
             "[repro] serial baseline: ReSplat pinned to CUDA default stream",
             flush=True,
         )
+
+    replay_raw = os.environ.get("PIPELINE_HISTORICAL_REPLAY_FRACTION")
+    if replay_raw is not None and float(replay_raw) > 0.0:
+        _install_historical_replay()
 
     if _env_flag("PIPELINE_ROOT_CAUSE_DIAGNOSTICS"):
         _install_root_cause_diagnostics()
