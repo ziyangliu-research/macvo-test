@@ -65,6 +65,23 @@ def _peek_resolved_config() -> dict[str, Any]:
     return base.resolve(config, root)
 
 
+def _materialize_packet_tensors(result: Any) -> None:
+    """Clone inference tensors so GraphDECO can attach autograd state safely.
+
+    ReSplat.infer() is decorated with torch.inference_mode().  Tensors created in
+    inference mode cannot be turned into trainable Parameters directly.  Cloning
+    them after infer() returns creates ordinary tensors while preserving values
+    and the original CPU/GPU handoff location.
+    """
+
+    packet = result.packet
+    packet.means = packet.means.clone()
+    packet.scales = packet.scales.clone()
+    packet.rotations_xyzw = packet.rotations_xyzw.clone()
+    packet.harmonics = packet.harmonics.clone()
+    packet.opacities = packet.opacities.clone()
+
+
 def _install_packet_prefilter(resolved: dict[str, Any]) -> None:
     from async_pipeline.resplat_runtime import ResplatPacketGenerator
 
@@ -102,6 +119,7 @@ def _install_packet_prefilter(resolved: dict[str, Any]) -> None:
     def infer_with_packet_prefilter(self: ResplatPacketGenerator, *args, **kwargs):
         nonlocal prefilter
         result = original_infer(self, *args, **kwargs)
+        _materialize_packet_tensors(result)
         if prefilter is None:
             prefilter = LocalPacketPrefilter(config, optimization)
             print(
