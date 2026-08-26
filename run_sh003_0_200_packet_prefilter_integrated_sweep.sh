@@ -52,6 +52,7 @@ run_one() {
   local split_offset
   local eval_enabled
   local opt_iterations
+  local -a pose_metric_arg=()
 
   if [[ "$run_mode" == "quality" ]]; then
     # Strict held-out test timestamps: 4,9,14,...,199.
@@ -62,6 +63,9 @@ run_one() {
     eval_enabled=true
     # 160 train packets * 100 global iterations.
     opt_iterations=16000
+    # ATE is evaluated after the streaming benchmark and does not contaminate
+    # streaming_wall_time_sec.
+    pose_metric_arg=(--with_pose_metrics)
   else
     # All 200 frames are train packets so timing represents continuous online
     # processing rather than a split in which 20% of timestamps skip ReSplat.
@@ -90,6 +94,7 @@ run_one() {
   TORCH_COMPILE_DISABLE=1 \
   python "$RUNNER" \
     --mode serial \
+    "${pose_metric_arg[@]}" \
     --config "$CONFIG" \
     --set paths.data_config="$DATA_CONFIG" \
     --set evaluation.gt_pose_file="$GT" \
