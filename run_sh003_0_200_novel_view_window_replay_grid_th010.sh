@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-# SH003 [0,200) strict 8:2 held-out novel-view ablation.
+# SH003 [0,200) strict 8:2 held-out W x R ablation.
 # Study the interaction between:
 #   W = recent local-map camera pool size
 #   R = number of historical optimizer slots per 100-step packet budget
@@ -14,17 +14,20 @@ set -u
 #   strict held-out split: 160 mapping / 40 test
 #
 # Grid:
-#   W=10: R=10,20,30
-#   W=20: R=10,20,30
+#   W in {5,10,20}
+#   R in {5,10,20,30}
 # Existing W10/R30 result from the replay30 threshold sweep is reused, so this
-# script runs only five missing cells.
+# script runs only eleven missing cells.
+#
+# The runner adds a final fixed_recent_10 metric while leaving optimization
+# behavior unchanged.  This makes recent-view quality comparable across W.
 
 cd /home/shiyo/Desktop/MAC-VO || exit 1
 
 CONFIG="Config/Pipeline/MACVO_ReSplat_Serial_TartanAirV1_SH003_0_200_AllFrames.yaml"
 DATA_CONFIG="Config/Sequence/TartanAirV1_Challenge_SH003.yaml"
 GT="/home/shiyo/Desktop/Datasets/TartanAir_Stereo_Challenge/ground_truth/stereo_gt/SH003.txt"
-RUNNER="run_pipeline_execution_benchmark_repro_empty_safe.py"
+RUNNER="run_pipeline_execution_benchmark_repro_fixed_recent10_eval.py"
 
 run_case() {
   local window="$1"
@@ -34,6 +37,11 @@ run_case() {
 print(${replay_slots}/100.0)
 PY
 )
+
+  if [[ "$window" == "10" && "$replay_slots" == "30" ]]; then
+    echo "[reuse] W10/R30 -> outputs/SH003_0_200_novelview_8to2_replay30_th010"
+    return 0
+  fi
 
   local name="W${window}_R${replay_slots}_th010"
   local work_dir="outputs/SH003_0_200_novelview_8to2_${name}"
@@ -49,7 +57,7 @@ PY
   echo
   echo "================================================================"
   echo "SH003 0-199 | strict 8:2 | W=${window} | R=${replay_slots}/100 | Th=.10"
-  echo "work_dir=${work_dir}"
+  echo "B=100 | M=50 | work_dir=${work_dir}"
   echo "================================================================"
 
   set +e
@@ -97,12 +105,20 @@ PY
   fi
 }
 
-# W10/R30 already exists as:
-# outputs/SH003_0_200_novelview_8to2_replay30_th010
+# Diagonal points first: directly test the W=R intuition.
+run_case 5 5
 run_case 10 10
-run_case 10 20
-run_case 20 10
 run_case 20 20
+
+# Off-diagonal controls.
+run_case 5 10
+run_case 5 20
+run_case 5 30
+run_case 10 5
+run_case 10 20
+run_case 10 30
+run_case 20 5
+run_case 20 10
 run_case 20 30
 
 echo
