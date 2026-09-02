@@ -12,7 +12,8 @@ set -u
 #       * online FPS/time from frame timing until last online backend update
 #       * post-hoc 10-pass refinement wall time measured separately
 #
-# The script is restart-safe: completed runs are skipped.
+# The script is restart-safe and failure-tolerant: completed runs are skipped;
+# one failed run does not abort the remaining 63 jobs.
 
 cd /home/shiyo/Desktop/MAC-VO || exit 1
 
@@ -121,7 +122,6 @@ run_quality() {
 
   mapfile -t args < <(common_args "$seq" "$n" "$bookkeeping_iters" "$work_dir" "$output_name")
 
-  set +e
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   PYTHONHASHSEED="$seed" \
   PIPELINE_BENCHMARK_SEED="$seed" \
@@ -135,7 +135,6 @@ run_quality() {
     "${args[@]}" \
     2>&1 | tee "$work_dir/run.log"
   local status=${PIPESTATUS[0]}
-  set -e
 
   echo "$status" > "$work_dir/exit_status.txt"
   if [[ "$status" -ne 0 ]]; then
@@ -170,7 +169,6 @@ run_timing() {
 
   mapfile -t args < <(common_args "$seq" "$n" "$bookkeeping_iters" "$work_dir" "$output_name")
 
-  set +e
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   PYTHONHASHSEED=0 \
   PIPELINE_BENCHMARK_SEED=0 \
@@ -184,7 +182,6 @@ run_timing() {
     --set backend.evaluation_enabled=false \
     2>&1 | tee "$work_dir/run.log"
   local status=${PIPESTATUS[0]}
-  set -e
 
   echo "$status" > "$work_dir/exit_status.txt"
   if [[ "$status" -ne 0 ]]; then
