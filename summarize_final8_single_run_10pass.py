@@ -31,12 +31,18 @@ def load_quality(seq: str) -> dict[str, Any] | None:
     if ate is None:
         return None
 
+    backend = summary.get("backend") or {}
+    num_gaussians = backend.get("final_num_gaussians")
+    if num_gaussians is None:
+        return None
+
     online = endpoint["online"]
     refined = endpoint["global_refined"]
     return {
         "sequence": seq,
         "seed": SEED,
         "ate_se3_rmse_m": float(ate),
+        "num_gaussians": int(num_gaussians),
         "online_train_psnr": online["train"]["psnr"],
         "online_train_ssim": online["train"]["ssim"],
         "online_train_lpips": online["train"]["lpips"],
@@ -66,13 +72,22 @@ def load_timing(seq: str) -> dict[str, Any] | None:
     frames = json.loads(frame_path.read_text(encoding="utf-8"))
     refine = json.loads(timing_path.read_text(encoding="utf-8"))
 
-    backend_ends = [float(r["backend_end_sec"]) for r in frames if r.get("backend_end_sec") is not None]
+    backend_ends = [
+        float(r["backend_end_sec"])
+        for r in frames
+        if r.get("backend_end_sec") is not None
+    ]
     if not backend_ends:
         return None
+
+    # Online timing endpoint = completion of the final online backend update.
+    # The post-hoc refinement happens later in backend.finalize(), so it is not
+    # included in this value.  This is deliberately independent of quality runs.
     online_sec = max(backend_ends)
     num_frames = int(summary["num_frames"])
     refine_sec = float(refine["refinement_wall_time_sec"])
     return {
+        "num_frames": num_frames,
         "online_fps": num_frames / online_sec,
         "online_wall_time_sec": online_sec,
         "refinement_wall_time_sec": refine_sec,
@@ -102,6 +117,8 @@ def main() -> None:
                 "sequence": seq,
                 "stage": stage,
                 "seed": SEED,
+                "num_train_views": q["num_train_views"],
+                "num_test_views": q["num_test_views"],
                 "train_psnr": q[f"{prefix}_train_psnr"],
                 "train_ssim": q[f"{prefix}_train_ssim"],
                 "train_lpips": q[f"{prefix}_train_lpips"],
@@ -109,6 +126,9 @@ def main() -> None:
                 "test_ssim": q[f"{prefix}_test_ssim"],
                 "test_lpips": q[f"{prefix}_test_lpips"],
                 "ate_se3_rmse_m": q["ate_se3_rmse_m"],
+                # Post-hoc refinement keeps topology fixed, so Online and
+                # +GlobalRefine10p have the same Gaussian count.
+                "num_gaussians": q["num_gaussians"],
                 "fps": None,
                 "online_wall_time_sec": None,
                 "refinement_wall_time_sec": None,
@@ -133,22 +153,27 @@ def main() -> None:
             writer = csv.DictWriter(fobj, fieldnames=list(rows[0].keys()))
             writer.writeheader()
             writer.writerows(rows)
-    json_path.write_text(json.dumps({"rows": rows, "missing": missing}, indent=2), encoding="utf-8")
+    json_path.write_text(
+        json.dumps({"rows": rows, "missing": missing}, indent=2),
+        encoding="utf-8",
+    )
 
     print("\n=== Prioritized 8-sequence single-run result (seed0) ===")
     print("SE000-SE003 + SH000-SH003 | ATE=SE3 RMSE | Global refinement=10 passes")
+    print("FPS/time come only from independent timing-only runs; quality runs are not used for timing.")
     header = (
         f"{'Seq':<6} {'Stage':<18} | {'Train P/S/L':<24} | {'Test P/S/L':<24} | "
-        f"{'ATE(m)':>8} {'FPS':>8} {'Online(s)':>10} {'Refine(s)':>10} {'Total(s)':>10}"
+        f"{'ATE(m)':>8} {'G(k)':>9} {'FPS':>8} {'Online(s)':>10} {'Refine(s)':>10} {'Total(s)':>10}"
     )
     print(header)
     print("-" * len(header))
     for r in rows:
         train = f"{f(r['train_psnr'],3)}/{f(r['train_ssim'],4)}/{f(r['train_lpips'],4)}"
         test = f"{f(r['test_psnr'],3)}/{f(r['test_ssim'],4)}/{f(r['test_lpips'],4)}"
+        gk = float(r["num_gaussians"]) / 1000.0
         print(
             f"{r['sequence']:<6} {r['stage']:<18} | {train:<24} | {test:<24} | "
-            f"{f(r['ate_se3_rmse_m'],4):>8} {f(r['fps'],3):>8} "
+            f"{f(r['ate_se3_rmse_m'],4):>8} {gk:>9.1f} {f(r['fps'],3):>8} "
             f"{f(r['online_wall_time_sec'],1):>10} {f(r['refinement_wall_time_sec'],1):>10} "
             f"{f(r['total_wall_time_sec'],1):>10}"
         )
