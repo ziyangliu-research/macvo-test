@@ -1,0 +1,132 @@
+version: 1
+
+# Final EuRoC evaluation protocol.
+# Temporal protocol is installed by the EuRoC wrapper runners:
+#   valid synchronized EuRoC stereo frames -> stride=5 -> strict 8:2 split.
+# The existing EuRoC_NoIMU loader reads cam0/cam1 sensor.yaml, rectifies the
+# stereo pair, masks to the GT-covered interval, and exposes per-frame rectified K.
+# ReSplat uses those dynamic rectified intrinsics in shared_tensors mode.
+#
+# ReSplat input is 384x256 (W x H). Both dimensions are divisible by 64 and the
+# 3:2 aspect ratio retains nearly all of EuRoC's 752x480 FoV with only a small
+# symmetric horizontal crop. MAC-VO / GraphDECO continue to use native 752x480.
+
+paths:
+  macvo_repo: .
+  resplat_repo: ../Resplat
+  gs_repo: ../gaussian-splatting
+  odom_config: Config/Experiment/MACVO/MACVO_Performant.yaml
+  data_config: Config/Sequence/EuRoC_MH02_local.yaml
+  resplat_checkpoint: null
+  work_dir: outputs/euroc4_stride5_10pass/MH02/quality_seed0
+
+sequence:
+  start_index: 0
+  # Launcher replaces this with the number of valid synchronized/GT-covered
+  # EuRoC frames BEFORE stride=5 is applied.
+  end_index: 1
+
+camera:
+  # Documentation/fallback values for the EuRoC stereo rig. In the formal
+  # shared-tensor path, ReSplat gets exact rectified K and baseline per frame.
+  stereo_baseline: 0.1100778422
+  fx: 435.2047
+  fy: 435.2047
+  cx: 367.4517
+  cy: 252.2009
+  left_subdir: cam0/data
+  right_subdir: cam1/data
+  left_pattern: "{index:06d}.png"
+  right_pattern: "{index:06d}.png"
+
+pose_frontend:
+  source: macvo
+  commit_policy: one_frame_delayed
+  dedicated_cuda_stream: false
+
+resplat_frontend:
+  experiment: tartanair_p000_ft
+  device: cuda:0
+  refine_steps: 0
+  refine_use_target: false
+  deterministic: false
+  overrides:
+    - dataset.image_shape=[256,384]
+  input_mode: shared_tensors
+  handoff_mode: pinned_cpu
+  strict_validation: false
+
+# Split is applied on the already stride-5 downsampled local sequence.
+# Local indices 4,9,14,... are tracking-only held-out views.
+split:
+  split_every: 5
+  split_offset: 4
+  split_index_mode: local_index
+
+evaluation:
+  # EuRoC endpoint runner uses dataset GT from state_groundtruth_estimate0 via
+  # the existing EuRoC loader; no TartanAir-style external pose txt is needed.
+  gt_pose_file: null
+  gt_source: dataset
+
+runtime:
+  backend_mode: incremental
+  queue_size: 2
+  poll_timeout_sec: 0.05
+  initialization_timeout_sec: 600.0
+  preload: false
+  pin_packet_memory: true
+
+backend:
+  output_name: incremental_EuRoC_stride5_quality_seed0
+  device: cuda:0
+  sh_degree: 3
+  local_map_size: 20
+  iterations_per_packet: 100
+  reset_new_packet_opacity: true
+  new_packet_reset_max_opacity: 0.01
+  maintenance_mode: standard
+  maintenance_after_local_iteration: 50
+  maintenance_grad_threshold: -1.0
+  maintenance_min_opacity: 0.10
+  maintenance_max_screen_size: -1.0
+  spatial_lr_scale: 1.0
+  minimum_scene_extent: 1.0
+  white_background: false
+  antialiasing: false
+
+  eval_before_optimization: false
+  eval_every_train_packets: 1000000
+  eval_max_views: 0
+  save_every_train_packets: 0
+  save_final_ply: false
+
+  wandb_mode: disabled
+  wandb_project: macvo-resplat-euroc
+  wandb_run_name: euroc_stride5
+  wandb_log_interval: 100
+  dedicated_cuda_stream: false
+  invalid_pose_policy: skip
+  write_runtime_artifacts: true
+  evaluation_enabled: true
+
+  optimization:
+    # Launcher replaces this bookkeeping value with N_train * 100.
+    iterations: 100
+    position_lr_init: 0.00016
+    position_lr_final: 0.0000016
+    position_lr_delay_mult: 0.01
+    position_lr_max_steps: 30000
+    feature_lr: 0.0025
+    opacity_lr: 0.025
+    scaling_lr: 0.005
+    rotation_lr: 0.001
+    exposure_lr_init: 0.01
+    exposure_lr_final: 0.001
+    exposure_lr_delay_steps: 0
+    exposure_lr_delay_mult: 0.0
+    percent_dense: 0.01
+    lambda_dssim: 0.2
+    densify_grad_threshold: 0.0002
+    random_background: false
+    optimizer_type: default
