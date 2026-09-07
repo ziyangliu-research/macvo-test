@@ -26,6 +26,56 @@ EDN2NED = pp.from_matrix(torch.tensor([
 NED2EDN = EDN2NED.Inv()
 
 
+def _sensor_distortion_coefficients(
+    sensor_config: SimpleNamespace,
+    sensor_yaml: Path,
+) -> np.ndarray:
+    """Return OpenCV radial-tangential coefficients from EuRoC sensor.yaml.
+
+    EuRoC stores four coefficients [k1, k2, p1, p2]. OpenCV accepts that form,
+    but we append k3=0 explicitly so the rectification contract is unambiguous.
+    This intentionally replaces the old dataset-wide hard-coded coefficients:
+    each sequence now consumes the calibration shipped with its own sensor.yaml.
+    """
+    model = str(getattr(sensor_config, "distortion_model", "")).strip().lower()
+    if model not in {"radial-tangential", "radtan"}:
+        raise ValueError(
+            f"unsupported EuRoC distortion model in {sensor_yaml}: {model!r}"
+        )
+
+    raw = getattr(sensor_config, "distortion_coefficients", None)
+    if raw is None:
+        raise ValueError(f"missing distortion_coefficients in {sensor_yaml}")
+    values = getattr(raw, "data", raw)
+    coeffs = np.asarray(values, dtype=np.float64).reshape(-1)
+    if coeffs.size == 4:
+        coeffs = np.concatenate([coeffs, np.zeros(1, dtype=np.float64)])
+    elif coeffs.size != 5:
+        raise ValueError(
+            f"expected 4 or 5 distortion coefficients in {sensor_yaml}, "
+            f"got {coeffs.size}: {coeffs.tolist()}"
+        )
+    if not np.all(np.isfinite(coeffs)):
+        raise ValueError(f"non-finite distortion coefficients in {sensor_yaml}")
+    return coeffs
+
+
+def _sensor_resolution(sensor_config: SimpleNamespace, sensor_yaml: Path) -> tuple[int, int]:
+    raw = getattr(sensor_config, "resolution", None)
+    if raw is None:
+        raise ValueError(f"missing resolution in {sensor_yaml}")
+    values = getattr(raw, "data", raw)
+    resolution = np.asarray(values, dtype=np.int64).reshape(-1)
+    if resolution.size != 2:
+        raise ValueError(
+            f"expected [width,height] resolution in {sensor_yaml}, got {resolution.tolist()}"
+        )
+    width, height = int(resolution[0]), int(resolution[1])
+    if width <= 0 or height <= 0:
+        raise ValueError(f"invalid resolution in {sensor_yaml}: {width}x{height}")
+    return width, height
+
+
 class EuRoC_Sequence(SequenceBase[StereoInertialFrame]):
     @classmethod
     def name(cls) -> str: return "EuRoC"
@@ -74,27 +124,45 @@ class EuRoC_StereoSequence(SequenceBase[StereoFrame]):
         # ref: https://github.com/raulmur/ORB_SLAM2/blob/master/Examples/Stereo/EuRoC.yaml
         # in this file only bl * fx is provided , the baseline here is derived by bf/fx
         self.baseline = 0.1100778422
-        self.width = 752
-        self.height = 480
-        
+
+        # Read the calibration shipped with this EuRoC sequence. The previous
+        # implementation read K/T_BS from sensor.yaml but hard-coded distortion;
+        # that can silently mismatch a sequence and makes the evaluation protocol
+        # harder to audit. All camera-model terms now come from sensor.yaml.
+        l_sensor_yaml = Path(self.seqRoot, "cam0", "sensor.yaml")
+        r_sensor_yaml = Path(self.seqRoot, "cam1", "sensor.yaml")
+        l_sensor_config, _ = load_config(l_sensor_yaml)
+        r_sensor_config, _ = load_config(r_sensor_yaml)
+
+        l_resolution = _sensor_resolution(l_sensor_config, l_sensor_yaml)
+        r_resolution = _sensor_resolution(r_sensor_config, r_sensor_yaml)
+        if l_resolution != r_resolution:
+            raise ValueError(
+                f"EuRoC stereo resolution mismatch: cam0={l_resolution}, cam1={r_resolution}"
+            )
+        self.width, self.height = l_resolution
+        if (self.width, self.height) != (752, 480):
+            raise ValueError(
+                "This EuRoC loader currently expects the standard 752x480 MAV image size, "
+                f"got {self.width}x{self.height} in {l_sensor_yaml}"
+            )
+
         # Left Camera
-        l_sensor_config, _ = load_config(Path(self.seqRoot, "cam0", "sensor.yaml"))
         T_BS_lcam = np.array(l_sensor_config.T_BS.data).reshape(4, 4)
         self.ImageL = EurocMonocularDataset(
             Path(self.seqRoot, "cam0", "data"), 
             K=self.build_intrinsic(l_sensor_config.intrinsics),
             T_BS=T_BS_lcam,
-            undistort=np.array([-0.28340811, 0.07395907, 0.00019359, 1.76187114e-05, 0.0])
+            undistort=_sensor_distortion_coefficients(l_sensor_config, l_sensor_yaml)
         )
         
         # Right Camera
-        r_sensor_config, _ = load_config(Path(self.seqRoot, "cam1", "sensor.yaml"))
         T_BS_rcam = np.array(r_sensor_config.T_BS.data).reshape(4, 4)
         self.ImageR = EurocMonocularDataset(
             Path(self.seqRoot, "cam1", "data"),
             K=self.build_intrinsic(r_sensor_config.intrinsics),
             T_BS=T_BS_rcam,
-            undistort=np.array([-0.28368365, 0.07451284, -0.00010473, -3.555907e-05, 0.0])
+            undistort=_sensor_distortion_coefficients(r_sensor_config, r_sensor_yaml)
         )
         
         # Sync left-right camera
