@@ -1,0 +1,5 @@
+type: EuRoC_NoIMU
+name: V101
+args:
+  root: /home/shiyo/Desktop/Datasets/EuRoC/extracted/vicon_room1/vicon_room1/V1_01_easy/mav0
+  gt_pose: true
