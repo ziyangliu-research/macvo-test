@@ -7,9 +7,10 @@ version: 1
 # stereo pair, masks to the GT-covered interval, and exposes per-frame rectified K.
 # ReSplat uses those dynamic rectified intrinsics in shared_tensors mode.
 #
-# ReSplat input is 384x256 (W x H). Both dimensions are divisible by 64 and the
-# 3:2 aspect ratio retains nearly all of EuRoC's 752x480 FoV with only a small
-# symmetric horizontal crop. MAC-VO / GraphDECO continue to use native 752x480.
+# ReSplat input is 384x256 (W x H). Both dimensions are divisible by 64.
+# EuRoC runtime support directly resizes the complete rectified 752x480 image to
+# this network shape with independent x/y intrinsic scaling, so NO camera FoV is
+# cropped. MAC-VO / GraphDECO continue to use native 752x480 rectified views.
 
 paths:
   macvo_repo: .
