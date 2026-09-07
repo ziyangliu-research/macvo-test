@@ -10,6 +10,9 @@ The formal EuRoC protocol used by the experiment launchers is:
 This module deliberately installs the stride only for ``EuRoC_NoIMU`` runs. It
 also makes the shared-tensor ReSplat path consume the per-frame rectified pixel
 intrinsics supplied by the EuRoC loader instead of the TartanAir static K.
+For EuRoC, ReSplat preprocessing preserves the complete rectified camera FoV:
+the 752x480 image is resized directly to the configured network shape and fx,
+fy,cx,cy are scaled independently in x/y. No center crop is applied.
 """
 from __future__ import annotations
 
@@ -20,6 +23,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from PIL import Image
 
 
 def frame_stride() -> int:
@@ -29,8 +33,55 @@ def frame_stride() -> int:
     return stride
 
 
+def _resize_full_fov_image_and_intrinsic(
+    image: Image.Image,
+    K_pixel: torch.Tensor,
+    image_shape: tuple[int, int],
+    normalize_intrinsics: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Resize EuRoC to the network shape without cropping any camera rays.
+
+    A direct x/y resize changes pixel aspect slightly when the requested network
+    shape does not exactly match EuRoC's 752:480 aspect ratio. The camera model
+    remains geometrically consistent because the x and y intrinsic rows are
+    scaled by the corresponding independent resize factors. This is preferable
+    here to the generic aspect-preserving center-crop path, because the global
+    GraphDECO map is supervised/evaluated on the complete rectified EuRoC FoV.
+    """
+    import torchvision.transforms.functional as TF
+
+    image = image.convert("RGB")
+    original_w, original_h = image.size
+    target_h, target_w = image_shape
+    if original_w <= 0 or original_h <= 0 or target_w <= 0 or target_h <= 0:
+        raise ValueError(
+            f"invalid image resize {original_w}x{original_h} -> {target_w}x{target_h}"
+        )
+
+    scale_x = target_w / original_w
+    scale_y = target_h / original_h
+    image = image.resize((target_w, target_h), Image.Resampling.BILINEAR)
+    tensor = TF.to_tensor(image)
+
+    K = K_pixel.clone().float()
+    K[0, 0] *= scale_x
+    K[0, 1] *= scale_x
+    K[0, 2] *= scale_x
+    K[1, 0] *= scale_y
+    K[1, 1] *= scale_y
+    K[1, 2] *= scale_y
+    if normalize_intrinsics:
+        K[0, 0] /= target_w
+        K[0, 1] /= target_w
+        K[0, 2] /= target_w
+        K[1, 0] /= target_h
+        K[1, 1] /= target_h
+        K[1, 2] /= target_h
+    return tensor, K
+
+
 def install_euroc_runtime_support() -> None:
-    """Install EuRoC-only stride, pose-coordinate, and ReSplat-K patches."""
+    """Install EuRoC-only stride, pose-coordinate, and ReSplat-K/FoV patches."""
     from DataLoader.SequenceBase import SequenceBase
     from Utility.Config import load_config
     from async_pipeline.macvo_runtime import (
@@ -38,10 +89,7 @@ def install_euroc_runtime_support() -> None:
         _pose7_xyzw_to_matrix,
         _tartan_from_cv,
     )
-    from async_pipeline.resplat_runtime import (
-        ResplatPacketGenerator,
-        process_pil_image_and_intrinsic,
-    )
+    from async_pipeline.resplat_runtime import ResplatPacketGenerator
     import torchvision.transforms.functional as TF
 
     # ------------------------------------------------------------------
@@ -118,11 +166,12 @@ def install_euroc_runtime_support() -> None:
     # ------------------------------------------------------------------
     # 3) In shared_tensors mode the EuRoC loader already supplies the exact
     # rectified K from sensor.yaml + stereoRectify. Use that dynamic K for
-    # ReSplat resize/crop rather than the static TartanAir K in config.
+    # ReSplat and preserve the complete rectified FoV. Unlike the generic
+    # TartanAir preprocessing helper, this EuRoC path does NOT center-crop.
     # ------------------------------------------------------------------
     original_load_inputs = ResplatPacketGenerator._load_input_images
-    if not getattr(original_load_inputs, "_euroc_dynamic_k_patch", False):
-        def load_inputs_with_dynamic_k(self, frame_input):
+    if not getattr(original_load_inputs, "_euroc_dynamic_k_full_fov_patch", False):
+        def load_inputs_with_dynamic_k_full_fov(self, frame_input):
             if self.config.input_mode != "shared_tensors":
                 return original_load_inputs(self, frame_input)
 
@@ -134,16 +183,16 @@ def install_euroc_runtime_support() -> None:
             right_pil = TF.to_pil_image(
                 frame_input.right_image.detach().cpu().clamp(0, 1)
             )
-            left, K_left = process_pil_image_and_intrinsic(
+            left, K_left = _resize_full_fov_image_and_intrinsic(
                 left_pil, K_pixel, self.image_shape, self.normalize_intrinsics
             )
-            right, K_right = process_pil_image_and_intrinsic(
+            right, K_right = _resize_full_fov_image_and_intrinsic(
                 right_pil, K_pixel, self.image_shape, self.normalize_intrinsics
             )
             return left, right, K_left, K_right
 
-        load_inputs_with_dynamic_k._euroc_dynamic_k_patch = True  # type: ignore[attr-defined]
-        ResplatPacketGenerator._load_input_images = load_inputs_with_dynamic_k
+        load_inputs_with_dynamic_k_full_fov._euroc_dynamic_k_full_fov_patch = True  # type: ignore[attr-defined]
+        ResplatPacketGenerator._load_input_images = load_inputs_with_dynamic_k_full_fov
 
 
 def evaluate_pose_euroc(
