@@ -1,0 +1,5 @@
+type: EuRoC_NoIMU
+name: MH05
+args:
+  root: /home/shiyo/Desktop/Datasets/EuRoC/extracted/machine_hall/machine_hall/MH_05_difficult/mav0
+  gt_pose: true
