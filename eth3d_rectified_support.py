@@ -118,8 +118,38 @@ def install_eth3d_runtime_support() -> None:
         ResplatPacketGenerator._load_input_images = load_inputs_eth3d
 
 
+def _collect_predicted_trajectory_from_frontend(
+    frontend,
+    count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Collect MAC-VO poses directly from a MacvoPoseFrontend instance.
+
+    The generic run_async_pipeline_metrics helper expects an AsyncPipelineRunner
+    and dereferences ``runner.pose_frontend``.  The ETH3D MAC-VO-only smoke test
+    deliberately runs the frontend by itself, so evaluate directly here instead
+    of wrapping it in a fake runner object.
+    """
+    if frontend.system is None:
+        raise RuntimeError("MAC-VO frontend is not initialized")
+    graph = frontend.system.graph
+    available = min(count, len(frontend._descriptors))
+    if available <= 0:
+        raise RuntimeError("no MAC-VO poses are available for ETH3D evaluation")
+
+    poses: list[np.ndarray] = []
+    valid: list[bool] = []
+    for index in range(available):
+        pose = frontend._opencv_relative_pose(index).detach().cpu().double().numpy()
+        need_interp = bool(
+            graph.frames.data["need_interp"][index].detach().cpu().item()
+        )
+        poses.append(pose)
+        valid.append(not need_interp)
+    return np.stack(poses, axis=0), np.asarray(valid, dtype=bool)
+
+
 def evaluate_pose_eth3d(
-    runner,
+    frontend,
     resolved: dict[str, Any],
     num_frames: int,
     output: Path,
@@ -127,13 +157,11 @@ def evaluate_pose_eth3d(
     """Evaluate MAC-VO against rectified-left ETH3D GT with SE(3)/Sim(3)."""
     from DataLoader import SequenceBase, StereoFrame
     from Utility.Config import load_config
-    from run_async_pipeline_metrics import (
-        collect_predicted_trajectory,
-        save_tum,
-        trajectory_metric,
-    )
+    from run_async_pipeline_metrics import save_tum, trajectory_metric
 
-    predicted_all, valid_mask = collect_predicted_trajectory(runner, num_frames)
+    predicted_all, valid_mask = _collect_predicted_trajectory_from_frontend(
+        frontend, num_frames
+    )
     data_cfg, _ = load_config(Path(resolved["paths"]["data_config"]))
     if str(data_cfg.type) != "ETH3D_Rectified":
         raise ValueError(f"expected ETH3D_Rectified, got {data_cfg.type}")
