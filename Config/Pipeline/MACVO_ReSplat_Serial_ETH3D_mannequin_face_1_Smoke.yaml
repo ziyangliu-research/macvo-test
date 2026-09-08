@@ -61,7 +61,8 @@ evaluation:
   gt_source: dataset
 
 runtime:
-  backend_mode: incremental
+  # ReSplat-only and MAC-VO-only smoke tests do not construct/run GraphDECO.
+  backend_mode: null
   queue_size: 2
   poll_timeout_sec: 0.05
   initialization_timeout_sec: 600.0
@@ -69,6 +70,7 @@ runtime:
   pin_packet_memory: true
 
 backend:
+  # Retained only because the common pipeline schema expects this section.
   output_name: incremental_ETH3D_mannequin_face_1_smoke
   device: cuda:0
   sh_degree: 3
@@ -85,7 +87,6 @@ backend:
   minimum_scene_extent: 1.0
   white_background: false
   antialiasing: false
-
   eval_before_optimization: false
   eval_every_train_packets: 1000000
   eval_max_views: 0
@@ -99,7 +100,6 @@ backend:
   invalid_pose_policy: skip
   write_runtime_artifacts: true
   evaluation_enabled: false
-
   optimization:
     iterations: 2000
     position_lr_init: 0.00016
