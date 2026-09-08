@@ -1,0 +1,5 @@
+type: ETH3D_Rectified
+name: mannequin_face_1_rectified
+args:
+  root: /home/shiyo/Desktop/Datasets/ETH3D_rectified/mannequin_face_1
+  gt_pose: true
