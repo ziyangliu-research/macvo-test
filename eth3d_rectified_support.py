@@ -149,7 +149,15 @@ def evaluate_pose_eth3d(
             f"len={len(sequence)}"
         )
 
-    gt_absolute = sequence.gt_pose_data[selected].matrix().detach().cpu().double().numpy()
+    selected_torch = torch.from_numpy(selected).long()
+    gt_absolute = (
+        sequence.gt_pose_data[selected_torch]
+        .matrix()
+        .detach()
+        .cpu()
+        .double()
+        .numpy()
+    )
     gt_first_inv = np.linalg.inv(gt_absolute[0])
     gt_all = gt_first_inv[None] @ gt_absolute
 
