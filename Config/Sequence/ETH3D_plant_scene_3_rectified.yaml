@@ -1,0 +1,5 @@
+type: ETH3D_Rectified
+name: plant_scene_3_rectified
+args:
+  root: /home/shiyo/Desktop/Datasets/ETH3D_rectified/plant_scene_3
+  gt_pose: true
