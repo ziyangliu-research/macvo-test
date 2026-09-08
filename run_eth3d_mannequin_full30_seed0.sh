@@ -4,9 +4,13 @@ set -u
 # Full mannequin_face_1 benchmark, seed0.
 # Online: all frames, strict 8:2, W20/rho=.30/B100/M50/Th=.10.
 # Quality: online endpoint + ONE continuous post-hoc refinement trajectory with
-#          PSNR/SSIM/LPIPS checkpoints at passes 10/15/20/25/30.
+#          user-selectable PSNR/SSIM/LPIPS checkpoints.
 # Timing : separate no-metric run, with cumulative refinement wall time at the
 #          same pass checkpoints.
+#
+# Defaults reproduce the original 10/15/20/25/30-pass run. Override with e.g.:
+#   CHECKPOINTS="10,20,30,40,50,60,70,80,90,100"
+#   OUTPUT_ROOT="outputs/eth3d_mannequin_full100"
 
 cd /home/shiyo/Desktop/MAC-VO || exit 1
 
@@ -14,11 +18,11 @@ GPU="${GPU:-0}"
 SEED="${SEED:-0}"
 FORCE="${FORCE:-0}"
 CHECKPOINTS="${CHECKPOINTS:-10,15,20,25,30}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/eth3d_mannequin_full30}"
 
 CONFIG="Config/Pipeline/MACVO_ReSplat_Serial_ETH3D_mannequin_face_1_Full.yaml"
 DATA_CONFIG="Config/Sequence/ETH3D_mannequin_face_1_rectified.yaml"
 DATA_ROOT="/home/shiyo/Desktop/Datasets/ETH3D_rectified/mannequin_face_1"
-OUTPUT_ROOT="outputs/eth3d_mannequin_full30"
 QUALITY_RUNNER="run_pipeline_execution_benchmark_repro_eth3d_refine_checkpoints_lpips.py"
 TIMING_RUNNER="run_pipeline_execution_benchmark_repro_eth3d_timing_checkpoints.py"
 
@@ -74,6 +78,7 @@ echo "ETH3D mannequin_face_1 FULL | seed=$SEED | frames=$n"
 echo "strict8:2 -> train=$ntrain test=$ntest"
 echo "online: W20/R30/B100/M50/Th=.10"
 echo "global refinement checkpoints: $CHECKPOINTS (single continuous run)"
+echo "output root: $OUTPUT_ROOT"
 echo "======================================================================"
 
 quality_dir="$OUTPUT_ROOT/quality_seed${SEED}"
@@ -189,4 +194,6 @@ else
   echo "[skip complete] TIMING: $timing_checkpoint"
 fi
 
+ETH3D_SUMMARY_ROOT="$OUTPUT_ROOT" \
+ETH3D_SUMMARY_CHECKPOINTS="$CHECKPOINTS" \
 python summarize_eth3d_mannequin_full30.py || true
