@@ -1,20 +1,36 @@
 #!/usr/bin/env python3
-"""Summarize the full mannequin_face_1 online + 10/15/20/25/30-pass run.
+"""Summarize ETH3D mannequin_face_1 online + multi-checkpoint refinement.
 
-Incomplete runs are reported as MISSING rather than treated as zero-valued data.
-Online FPS/wall time comes from the separate timing run's frame completion log;
-quality metrics and SE3 ATE come from the quality run.
+Defaults reproduce the original 10/15/20/25/30-pass summary, but both the
+output root and checkpoint list can be overridden with environment variables:
+  ETH3D_SUMMARY_ROOT
+  ETH3D_SUMMARY_CHECKPOINTS
+Incomplete runs are reported as MISSING rather than treated as zeros.
 """
 from __future__ import annotations
 
 import csv
 import json
+import os
 from pathlib import Path
 from typing import Any
 
-ROOT = Path("outputs/eth3d_mannequin_full30")
-SEED = 0
-CHECKPOINTS = (10, 15, 20, 25, 30)
+ROOT = Path(os.environ.get("ETH3D_SUMMARY_ROOT", "outputs/eth3d_mannequin_full30"))
+SEED = int(os.environ.get("ETH3D_SUMMARY_SEED", "0"))
+CHECKPOINTS = tuple(
+    sorted(
+        {
+            int(x.strip())
+            for x in os.environ.get(
+                "ETH3D_SUMMARY_CHECKPOINTS", "10,15,20,25,30"
+            ).split(",")
+            if x.strip()
+        }
+    )
+)
+if not CHECKPOINTS or any(x <= 0 for x in CHECKPOINTS):
+    raise ValueError(f"invalid ETH3D_SUMMARY_CHECKPOINTS: {CHECKPOINTS}")
+
 QUALITY_NAME = f"incremental_ETH3D_mannequin_quality_seed{SEED}"
 TIMING_NAME = f"incremental_ETH3D_mannequin_timing_seed{SEED}"
 
@@ -190,7 +206,8 @@ def main() -> None:
             }
         )
 
-    print("\n=== ETH3D mannequin_face_1 | full | strict8:2 | seed0 ===")
+    print(f"\n=== ETH3D mannequin_face_1 | full | strict8:2 | seed{SEED} ===")
+    print(f"checkpoints: {list(CHECKPOINTS)}")
     print(
         f"{'Stage':22s} | {'Train P/S/L':24s} | {'Test P/S/L':24s} | "
         f"{'ATE(m)':>8s} {'G(k)':>9s} {'FPS':>8s} {'Online(s)':>10s} {'Refine(s)':>10s} {'Total(s)':>10s}"
@@ -204,8 +221,8 @@ def main() -> None:
             f"{fmt(row['online_wall_sec'],1):>10s} {fmt(row['refine_sec'],1):>10s} {fmt(row['total_sec'],1):>10s}"
         )
 
-    csv_path = ROOT / "summary_seed0.csv"
-    json_path = ROOT / "summary_seed0.json"
+    csv_path = ROOT / f"summary_seed{SEED}.csv"
+    json_path = ROOT / f"summary_seed{SEED}.json"
     ROOT.mkdir(parents=True, exist_ok=True)
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
