@@ -7,5 +7,6 @@ from .Dataset.TartanAir2    import TartanAirV2_StereoSequence, TartanAirV2_Seque
 from .Dataset.Train         import TrainDataset
 from .Dataset.KITTI         import KITTI_StereoSequence
 from .Dataset.EuRoC         import EuRoC_StereoSequence, EuRoC_Sequence
+from .Dataset.ETH3D         import ETH3DRectifiedStereoSequence
 from .Dataset.VBR           import VBR_StereoSequence
 from .Dataset.GeneralStereo import GeneralStereoSequence
