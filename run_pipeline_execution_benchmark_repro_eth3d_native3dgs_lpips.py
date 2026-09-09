@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import run_async_pipeline_metrics as pose_metrics
 from eth3d_rectified_support import evaluate_pose_eth3d, install_eth3d_runtime_support
+from online_test_render_export import install_online_test_render_export
 
 # Install ETH3D rectified-camera/runtime semantics before pipeline construction.
 install_eth3d_runtime_support()
@@ -21,5 +22,8 @@ import run_pipeline_execution_benchmark_repro_posthoc_global_refine_native3dgs_l
 if __name__ == "__main__":
     native.quality_helpers._disable_intermediate_online_evaluation()
     native.quality_helpers._install_lpips_evaluator()
+    # The first all-test evaluation is the online endpoint. Export its images
+    # before the extra opacity reset and native GraphDECO global refinement.
+    install_online_test_render_export()
     native._install_native_graphdeco_refinement()
     native.safe.repro.main()
