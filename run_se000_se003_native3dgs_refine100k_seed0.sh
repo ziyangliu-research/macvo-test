@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
 # Full TartanAir Stereo Challenge SE000-SE003 benchmark.
 # Online protocol: strict8:2, W20/rho=.30/B100/M50/Th=.10, serial/default ReSplat stream.
 # Post-hoc refinement: one extra opacity reset, then the native GraphDECO
 # densification/pruning/reset schedule, with exact metric checkpoints every 10k
 # optimizer updates from 10k through 100k.
+#
+# Native densification can make one rasterization kernel substantially longer
+# than the fixed-topology refinement path.  A GPU that is also driving X/Wayland
+# may therefore trip NVIDIA's kernel execution watchdog (cudaErrorLaunchTimeout).
+# By default this launcher refuses a long run when that watchdog is enabled,
+# preserving the native optimization protocol instead of weakening densification.
 
-cd /home/shiyo/Desktop/MAC-VO
+cd /home/shiyo/Desktop/MAC-VO || exit 1
 
 GPU="${GPU:-0}"
 SEED="${SEED:-0}"
 FORCE="${FORCE:-0}"
+WATCHDOG_POLICY="${WATCHDOG_POLICY:-require_disabled}"  # require_disabled | warn | ignore
 ITER_CHECKPOINTS="${ITER_CHECKPOINTS:-10000,20000,30000,40000,50000,60000,70000,80000,90000,100000}"
 TOTAL_ITERS="${TOTAL_ITERS:-100000}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/se000_se003_native3dgs_refine100k}"
@@ -25,6 +32,41 @@ python - <<'PY'
 from lpips import LPIPS
 print('[preflight] LPIPS import OK')
 PY
+if [[ $? -ne 0 ]]; then
+  echo "[fatal] LPIPS import failed" >&2
+  exit 2
+fi
+
+if command -v nvidia-smi >/dev/null 2>&1; then
+  watchdog=$(nvidia-smi -q -i "$GPU" 2>/dev/null | awk -F: '/Kernel Execution Timeout/{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')
+  if [[ -n "$watchdog" ]]; then
+    echo "[preflight] GPU $GPU Kernel Execution Timeout: $watchdog"
+    if [[ "$watchdog" == "Enabled" && "$WATCHDOG_POLICY" == "require_disabled" ]]; then
+      cat >&2 <<'EOF'
+[fatal] NVIDIA kernel execution watchdog is enabled on the selected GPU.
+Native 3DGS densification can create rasterization kernels long enough to hit
+cudaErrorLaunchTimeout.  Do not change the densification/pruning protocol to
+work around this.  Run the experiment on a non-display/headless GPU, or stop the
+display manager from SSH/TTY first, then rerun this launcher.
+
+Check:
+  nvidia-smi -q -i 0 | grep -A2 "Kernel Execution Timeout"
+
+Typical Ubuntu headless step (run from SSH/TTY; local GUI will disappear):
+  sudo systemctl stop display-manager
+
+Restore GUI after experiments:
+  sudo systemctl start display-manager
+
+To bypass only this preflight check (not recommended):
+  WATCHDOG_POLICY=warn bash run_se000_se003_native3dgs_refine100k_seed0.sh
+EOF
+      exit 90
+    elif [[ "$watchdog" == "Enabled" && "$WATCHDOG_POLICY" == "warn" ]]; then
+      echo "[warn] CUDA watchdog is enabled; cudaErrorLaunchTimeout remains possible" >&2
+    fi
+  fi
+fi
 
 mkdir -p "$OUTPUT_ROOT"
 
@@ -63,9 +105,8 @@ if not left or len(left) != len(right):
     raise SystemExit(f'invalid stereo counts left={len(left)} right={len(right)}')
 print(len(left))
 PY
-  )
+  ) || exit 2
 
-  # split offset 4 means indices 4,9,14,... are held out.
   ntest=$(( n / 5 ))
   ntrain=$(( n - ntest ))
   online_bookkeeping_iters=$(( ntrain * 100 ))
@@ -100,6 +141,7 @@ PY
   echo "Output=$work"
   echo "======================================================================"
 
+  set +e
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   PYTHONHASHSEED="$SEED" \
   PIPELINE_BENCHMARK_SEED="$SEED" \
@@ -141,6 +183,20 @@ PY
     --set paths.work_dir="$work" \
     --set backend.output_name="$name" \
     2>&1 | tee "$work/run.log"
+  status=${PIPESTATUS[0]}
+  set -e
+  echo "$status" > "$work/exit_status.txt"
+
+  if [[ "$status" -ne 0 ]]; then
+    echo "[FAILED] $seq exit=$status" >&2
+    python summarize_se_native3dgs_partial.py "$OUTPUT_ROOT" "$seq" "$SEED" || true
+    if grep -qE 'launch timed out and was terminated|cudaErrorLaunchTimeout' "$work/run.log"; then
+      echo "[fatal] CUDA launch timeout detected.  The CUDA context is no longer reliable." >&2
+      echo "        Disable the display-GPU watchdog / use a headless GPU, then rerun." >&2
+      exit 70
+    fi
+    exit "$status"
+  fi
 
 done
 
