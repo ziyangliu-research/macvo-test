@@ -11,8 +11,16 @@ from PIL import Image
 ETH3D_ROOT = Path(
     "/home/shiyo/Desktop/MAC-VO/outputs/eth3d4_native3dgs_refine100k"
 )
-TARTANAIR_ROOT = Path(
+
+# New TartanAir sweep contains SE002-SE003 and SH000-SH003.
+TARTANAIR_NEW_ROOT = Path(
     "/home/shiyo/Desktop/MAC-VO/outputs/tartanair_se002_sh003_native3dgs_refine100k"
+)
+
+# Earlier completed native-3DGS sweep contains SE000-SE003.  We only need this
+# as the fallback/source for SE000-SE001; SE002-SE003 prefer the newer sweep.
+TARTANAIR_OLD_ROOT = Path(
+    "/home/shiyo/Desktop/MAC-VO/outputs/se000_se003_native3dgs_refine100k"
 )
 
 ETH3D_SEQS = (
@@ -21,7 +29,16 @@ ETH3D_SEQS = (
     "sofa_3",
     "plant_scene_3",
 )
-TARTANAIR_SEQS = ("SH000", "SH001", "SH002", "SH003")
+TARTANAIR_SEQS = (
+    "SE000",
+    "SE001",
+    "SE002",
+    "SE003",
+    "SH000",
+    "SH001",
+    "SH002",
+    "SH003",
+)
 TOP_K = 10
 
 
@@ -36,18 +53,25 @@ def compute_psnr(gt_path: Path, render_path: Path) -> float:
     return 20.0 * math.log10(255.0 / math.sqrt(mse))
 
 
-def find_render_root(sequence_root: Path) -> Path | None:
-    candidates = sorted(sequence_root.glob("quality_seed0/*/online_test_renders"))
-    if not candidates:
-        candidates = sorted(sequence_root.glob("**/online_test_renders"))
-    return candidates[0] if candidates else None
+def find_render_root(sequence_roots: list[Path]) -> Path | None:
+    """Return the first existing online_test_renders root in priority order."""
+    for sequence_root in sequence_roots:
+        candidates = sorted(sequence_root.glob("quality_seed0/*/online_test_renders"))
+        if not candidates:
+            candidates = sorted(sequence_root.glob("**/online_test_renders"))
+        if candidates:
+            return candidates[0]
+    return None
 
 
-def rank_sequence(dataset: str, sequence: str, sequence_root: Path):
-    render_root = find_render_root(sequence_root)
+def rank_sequence(dataset: str, sequence: str, sequence_roots: list[Path]):
+    render_root = find_render_root(sequence_roots)
     if render_root is None:
         print(f"\n=== {dataset} / {sequence} ===")
         print("MISSING: online_test_renders not found")
+        print("Searched:")
+        for root in sequence_roots:
+            print(f"  {root}")
         return [], []
 
     results = []
@@ -88,17 +112,30 @@ def rank_sequence(dataset: str, sequence: str, sequence_root: Path):
     return results, skipped
 
 
+def tartanair_roots(seq: str) -> list[Path]:
+    # SE000-SE001 were completed in the earlier SE sweep.
+    if seq in {"SE000", "SE001"}:
+        return [TARTANAIR_OLD_ROOT / seq, TARTANAIR_NEW_ROOT / seq]
+
+    # SE002-SE003 and all SH sequences use the newer sweep first.  The old root
+    # is retained as a fallback for SE002-SE003 if needed.
+    roots = [TARTANAIR_NEW_ROOT / seq]
+    if seq in {"SE002", "SE003"}:
+        roots.append(TARTANAIR_OLD_ROOT / seq)
+    return roots
+
+
 def main() -> None:
     all_top_rows = []
     all_rows = []
 
-    jobs = [
-        *(('ETH3D', seq, ETH3D_ROOT / seq) for seq in ETH3D_SEQS),
-        *(('TartanAir', seq, TARTANAIR_ROOT / seq) for seq in TARTANAIR_SEQS),
+    jobs: list[tuple[str, str, list[Path]]] = [
+        *(("ETH3D", seq, [ETH3D_ROOT / seq]) for seq in ETH3D_SEQS),
+        *(("TartanAir", seq, tartanair_roots(seq)) for seq in TARTANAIR_SEQS),
     ]
 
-    for dataset, sequence, sequence_root in jobs:
-        results, _ = rank_sequence(dataset, sequence, sequence_root)
+    for dataset, sequence, sequence_roots in jobs:
+        results, _ = rank_sequence(dataset, sequence, sequence_roots)
         for rank, (psnr, frame_index, folder_name, folder_path) in enumerate(
             results, start=1
         ):
@@ -120,7 +157,15 @@ def main() -> None:
 
     top_csv = out_dir / "online_test_psnr_top10.csv"
     all_csv = out_dir / "online_test_psnr_all.csv"
-    fieldnames = ["dataset", "sequence", "rank", "frame_index", "folder", "psnr_db", "path"]
+    fieldnames = [
+        "dataset",
+        "sequence",
+        "rank",
+        "frame_index",
+        "folder",
+        "psnr_db",
+        "path",
+    ]
 
     for path, rows in ((top_csv, all_top_rows), (all_csv, all_rows)):
         with path.open("w", newline="", encoding="utf-8") as f:
@@ -129,7 +174,10 @@ def main() -> None:
             writer.writerows(rows)
 
     print("\n============================================================")
-    print(f"Top-10 CSV: {top_csv}")
+    print("Processed sequences: 12 total")
+    print("  ETH3D    : mannequin_face_1, einstein_1, sofa_3, plant_scene_3")
+    print("  TartanAir: SE000-SE003, SH000-SH003")
+    print(f"Top-10 CSV : {top_csv}")
     print(f"All-view CSV: {all_csv}")
     print("============================================================")
 
