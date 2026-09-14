@@ -5,6 +5,12 @@ This wrapper keeps the online mapping algorithm unchanged and replaces the
 normal finalize-time evaluation with a single metric: mean PSNR over all
 held-out test cameras. It performs no post-hoc/global refinement and skips
 train/active-map evaluation, SSIM, LPIPS, ATE, and image export.
+
+The online optimizer uses the same empty-map-safe replay wrapper as the formal
+native-3DGS benchmark. Aggressive opacity pruning is therefore allowed to prune
+all Gaussians: meaningless zero-Gaussian backward passes are skipped until the
+next train packet appends Gaussians again. Pruning itself is not weakened and no
+Gaussian is rescued.
 """
 from __future__ import annotations
 
@@ -12,7 +18,7 @@ import time
 
 import torch
 
-import run_pipeline_execution_benchmark_repro as repro
+import run_pipeline_execution_benchmark_repro_empty_safe as safe
 
 
 def _install_test_psnr_only_finalize() -> None:
@@ -89,4 +95,4 @@ def _install_test_psnr_only_finalize() -> None:
 
 if __name__ == "__main__":
     _install_test_psnr_only_finalize()
-    repro.main()
+    safe.repro.main()
