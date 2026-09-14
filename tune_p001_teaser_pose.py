@@ -11,15 +11,23 @@ Default inputs:
     teaser_overview/probe_pose_current_relative.json
 
 The tool never re-runs MAC-VO, ReSplat, or online optimization.
+
+UI modes:
+  --ui auto    Use OpenCV GUI when a display is available; otherwise web UI.
+  --ui opencv  Force the original OpenCV HighGUI window.
+  --ui web     Headless browser UI, intended for VS Code Remote SSH.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import math
+import os
 import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -65,17 +73,23 @@ def _orthonormalize(r: torch.Tensor) -> torch.Tensor:
 
 def _rot_x(a: float) -> torch.Tensor:
     c, s = math.cos(a), math.sin(a)
-    return torch.tensor([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]], dtype=torch.float64)
+    return torch.tensor(
+        [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]], dtype=torch.float64
+    )
 
 
 def _rot_y(a: float) -> torch.Tensor:
     c, s = math.cos(a), math.sin(a)
-    return torch.tensor([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]], dtype=torch.float64)
+    return torch.tensor(
+        [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]], dtype=torch.float64
+    )
 
 
 def _rot_z(a: float) -> torch.Tensor:
     c, s = math.cos(a), math.sin(a)
-    return torch.tensor([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=torch.float64)
+    return torch.tensor(
+        [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=torch.float64
+    )
 
 
 def _translate_local(pose: torch.Tensor, dx: float, dy: float, dz: float) -> None:
@@ -87,9 +101,18 @@ def _rotate_local(pose: torch.Tensor, r_local: torch.Tensor) -> None:
     pose[:3, :3] = _orthonormalize(pose[:3, :3] @ r_local)
 
 
-def _make_camera(get_projection_matrix, pose: torch.Tensor, device: torch.device,
-                 width: int, height: int, fx_norm: float, fy_norm: float,
-                 focal_scale: float, znear: float, zfar: float):
+def _make_camera(
+    get_projection_matrix,
+    pose: torch.Tensor,
+    device: torch.device,
+    width: int,
+    height: int,
+    fx_norm: float,
+    fy_norm: float,
+    focal_scale: float,
+    znear: float,
+    zfar: float,
+):
     fx = fx_norm * width * focal_scale
     fy = fy_norm * height * focal_scale
     fovx = 2.0 * math.atan(width / (2.0 * fx))
@@ -126,7 +149,8 @@ def _make_camera(get_projection_matrix, pose: torch.Tensor, device: torch.device
 
 def _tensor_to_bgr(image: torch.Tensor) -> np.ndarray:
     rgb = (
-        image.detach().clamp(0.0, 1.0)
+        image.detach()
+        .clamp(0.0, 1.0)
         .permute(1, 2, 0)
         .mul(255.0)
         .round()
@@ -141,8 +165,14 @@ def _write_pose(path: Path, pose: torch.Tensor) -> None:
     path.write_text(json.dumps(pose.tolist(), indent=2), encoding="utf-8")
 
 
-def _save_state(output_dir: Path, stem: str, image_bgr: np.ndarray,
-                pose: torch.Tensor, args, focal_scale: float) -> None:
+def _save_state(
+    output_dir: Path,
+    stem: str,
+    image_bgr: np.ndarray,
+    pose: torch.Tensor,
+    args,
+    focal_scale: float,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(output_dir / f"{stem}.png"), image_bgr)
     _write_pose(output_dir / f"{stem}_pose.json", pose)
@@ -179,9 +209,9 @@ def _print_help() -> None:
         "  3 / 4 : halve / double rotation step\n"
         "  0     : reset to starting pose + FOV\n"
         "  p     : save numbered candidate PNG + pose JSON\n"
-        "  Enter : save FINAL PNG + pose JSON and exit\n"
+        "  Enter : save FINAL PNG + pose JSON\n"
         "  h     : print this help\n"
-        "  Esc   : exit without changing FINAL\n"
+        "  Esc   : exit OpenCV UI\n"
     )
 
 
@@ -209,6 +239,313 @@ def _load_gaussians(gs_repo: Path, ply: Path, device: torch.device):
     return gaussians, render, getProjectionMatrix, pipe, background
 
 
+def _apply_key(
+    key: str,
+    pose: torch.Tensor,
+    start_pose: torch.Tensor,
+    focal_scale: float,
+    translation_step: float,
+    rotation_step: float,
+    args,
+):
+    rerender = True
+    if key == "0":
+        pose = start_pose.clone()
+        focal_scale = 1.0
+    elif key == "1":
+        translation_step *= 0.5
+        rerender = False
+    elif key == "2":
+        translation_step *= 2.0
+        rerender = False
+    elif key == "3":
+        rotation_step *= 0.5
+        rerender = False
+    elif key == "4":
+        rotation_step *= 2.0
+        rerender = False
+    elif key == "[":
+        focal_scale /= args.fov_step
+    elif key == "]":
+        focal_scale *= args.fov_step
+    elif key == "w":
+        _translate_local(pose, 0.0, 0.0, translation_step)
+    elif key == "s":
+        _translate_local(pose, 0.0, 0.0, -translation_step)
+    elif key == "a":
+        _translate_local(pose, -translation_step, 0.0, 0.0)
+    elif key == "d":
+        _translate_local(pose, translation_step, 0.0, 0.0)
+    elif key == "r":
+        _translate_local(pose, 0.0, -translation_step, 0.0)
+    elif key == "f":
+        _translate_local(pose, 0.0, translation_step, 0.0)
+    elif key == "j":
+        _rotate_local(pose, _rot_y(-rotation_step))
+    elif key == "l":
+        _rotate_local(pose, _rot_y(rotation_step))
+    elif key == "i":
+        _rotate_local(pose, _rot_x(rotation_step))
+    elif key == "k":
+        _rotate_local(pose, _rot_x(-rotation_step))
+    elif key == "u":
+        _rotate_local(pose, _rot_z(-rotation_step))
+    elif key == "o":
+        _rotate_local(pose, _rot_z(rotation_step))
+    else:
+        rerender = False
+    return pose, focal_scale, translation_step, rotation_step, rerender
+
+
+def _run_opencv_ui(
+    render_current,
+    pose: torch.Tensor,
+    start_pose: torch.Tensor,
+    focal_scale: float,
+    translation_step: float,
+    rotation_step: float,
+    output_dir: Path,
+    args,
+) -> None:
+    candidate_idx = 0
+    window = "P001 teaser pose tuner"
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    image_bgr = render_current(pose, focal_scale)
+
+    while True:
+        display = image_bgr.copy()
+        cv2.putText(
+            display,
+            f"move={translation_step:.4f}m  rot={math.degrees(rotation_step):.3f}deg  focal={focal_scale:.4f}",
+            (12, 26),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.imshow(window, display)
+        raw = cv2.waitKey(0) & 0xFF
+        if raw == 27:
+            print("[pose-tuner] exit without saving FINAL")
+            break
+        if raw in (10, 13):
+            _save_state(output_dir, "final", image_bgr, pose, args, focal_scale)
+            print(f"[pose-tuner] FINAL saved under: {output_dir}")
+            break
+
+        key = chr(raw) if 0 <= raw < 128 else ""
+        if key == "h":
+            _print_help()
+            continue
+        if key == "p":
+            candidate_idx += 1
+            stem = f"candidate_{candidate_idx:03d}"
+            _save_state(output_dir, stem, image_bgr, pose, args, focal_scale)
+            print(f"[pose-tuner] saved {stem}")
+            continue
+
+        pose, focal_scale, translation_step, rotation_step, rerender = _apply_key(
+            key,
+            pose,
+            start_pose,
+            focal_scale,
+            translation_step,
+            rotation_step,
+            args,
+        )
+        if rerender:
+            image_bgr = render_current(pose, focal_scale)
+
+    cv2.destroyAllWindows()
+
+
+def _web_html() -> str:
+    return r'''<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P001 teaser pose tuner</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:18px;background:#111;color:#eee}main{max-width:1100px;margin:auto}img{width:100%;height:auto;background:#000;border:1px solid #444}.row{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}.group{border:1px solid #444;padding:10px;border-radius:8px}button{font-size:15px;min-width:58px;min-height:38px;background:#252525;color:#eee;border:1px solid #666;border-radius:6px;cursor:pointer}button:hover{background:#333}.status{font-family:ui-monospace,monospace;white-space:pre-wrap;margin:8px 0;color:#ccc}.hint{color:#aaa;font-size:14px}kbd{background:#333;border:1px solid #666;border-radius:3px;padding:1px 5px}
+</style>
+</head>
+<body><main>
+<img id="view" alt="Rendered P001 Gaussian map">
+<div id="status" class="status">Loading...</div>
+<div class="row">
+  <div class="group"><b>Move</b><div class="row"><button data-k="w">W Forward</button><button data-k="s">S Back</button><button data-k="a">A Left</button><button data-k="d">D Right</button><button data-k="r">R Up</button><button data-k="f">F Down</button></div></div>
+  <div class="group"><b>Rotate</b><div class="row"><button data-k="j">J Yaw-</button><button data-k="l">L Yaw+</button><button data-k="i">I Pitch+</button><button data-k="k">K Pitch-</button><button data-k="u">U Roll-</button><button data-k="o">O Roll+</button></div></div>
+</div>
+<div class="row">
+  <button data-k="[">[ Wider FOV</button><button data-k="]">] Narrower FOV</button>
+  <button data-k="1">1 Move /2</button><button data-k="2">2 Move ×2</button>
+  <button data-k="3">3 Rot /2</button><button data-k="4">4 Rot ×2</button>
+  <button data-k="0">0 Reset</button>
+  <button id="candidate">P Save candidate</button><button id="final">Enter Save final</button>
+</div>
+<p class="hint">Keyboard works when this page has focus: <kbd>WASD</kbd>, <kbd>R/F</kbd>, <kbd>IJKL</kbd>, <kbd>U/O</kbd>, <kbd>[ ]</kbd>, <kbd>1-4</kbd>, <kbd>0</kbd>, <kbd>P</kbd>, <kbd>Enter</kbd>.</p>
+<script>
+const img=document.getElementById('view'), statusEl=document.getElementById('status');
+let busy=false, seq=0;
+async function refresh(){
+  const s=await (await fetch('/state?'+Date.now(),{cache:'no-store'})).json();
+  statusEl.textContent=`move=${s.translation_step_m.toFixed(5)} m   rot=${s.rotation_step_deg.toFixed(4)} deg   focal=${s.focal_scale.toFixed(5)}\nposition=[${s.position.map(v=>v.toFixed(4)).join(', ')}]   candidates=${s.candidate_count}\n${s.message||''}`;
+  img.src='/frame.png?v='+(++seq);
+}
+async function action(key){if(busy)return;busy=true;try{await fetch('/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key})});await refresh();}finally{busy=false;}}
+document.querySelectorAll('button[data-k]').forEach(b=>b.addEventListener('click',()=>action(b.dataset.k)));
+document.getElementById('candidate').addEventListener('click',()=>action('p'));
+document.getElementById('final').addEventListener('click',()=>action('enter'));
+window.addEventListener('keydown',e=>{
+  if(e.repeat||e.ctrlKey||e.metaKey||e.altKey)return;
+  let k=e.key;
+  if(k==='Enter') k='enter';
+  if(k.length===1) k=k.toLowerCase();
+  if(['w','s','a','d','r','f','j','l','i','k','u','o','[',']','1','2','3','4','0','p','enter'].includes(k)){e.preventDefault();action(k);}
+});
+refresh();
+</script>
+</main></body></html>'''
+
+
+def _run_web_ui(
+    render_current,
+    pose: torch.Tensor,
+    start_pose: torch.Tensor,
+    focal_scale: float,
+    translation_step: float,
+    rotation_step: float,
+    output_dir: Path,
+    args,
+) -> None:
+    state = {
+        "pose": pose,
+        "focal_scale": focal_scale,
+        "translation_step": translation_step,
+        "rotation_step": rotation_step,
+        "candidate_idx": 0,
+        "image_bgr": None,
+        "png": b"",
+        "message": "",
+    }
+
+    def rerender() -> None:
+        state["image_bgr"] = render_current(state["pose"], state["focal_scale"])
+        ok, encoded = cv2.imencode(".png", state["image_bgr"])
+        if not ok:
+            raise RuntimeError("cv2.imencode(.png) failed")
+        state["png"] = encoded.tobytes()
+
+    rerender()
+
+    def state_json() -> bytes:
+        p = state["pose"]
+        payload = {
+            "translation_step_m": float(state["translation_step"]),
+            "rotation_step_deg": math.degrees(float(state["rotation_step"])),
+            "focal_scale": float(state["focal_scale"]),
+            "position": [float(x) for x in p[:3, 3].tolist()],
+            "candidate_count": int(state["candidate_idx"]),
+            "message": str(state["message"]),
+        }
+        return json.dumps(payload).encode("utf-8")
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *values):
+            return
+
+        def _send(self, status: int, content_type: str, body: bytes) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            path = urlparse(self.path).path
+            if path == "/":
+                self._send(200, "text/html; charset=utf-8", _web_html().encode("utf-8"))
+            elif path == "/frame.png":
+                self._send(200, "image/png", state["png"])
+            elif path == "/state":
+                self._send(200, "application/json", state_json())
+            else:
+                self._send(404, "text/plain; charset=utf-8", b"not found")
+
+        def do_POST(self):
+            if urlparse(self.path).path != "/action":
+                self._send(404, "text/plain; charset=utf-8", b"not found")
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                request = json.loads(self.rfile.read(length).decode("utf-8"))
+                key = str(request.get("key", ""))
+
+                if key == "p":
+                    state["candidate_idx"] += 1
+                    stem = f"candidate_{state['candidate_idx']:03d}"
+                    _save_state(
+                        output_dir,
+                        stem,
+                        state["image_bgr"],
+                        state["pose"],
+                        args,
+                        state["focal_scale"],
+                    )
+                    state["message"] = f"saved {stem}"
+                elif key == "enter":
+                    _save_state(
+                        output_dir,
+                        "final",
+                        state["image_bgr"],
+                        state["pose"],
+                        args,
+                        state["focal_scale"],
+                    )
+                    state["message"] = f"FINAL saved under {output_dir}"
+                else:
+                    (
+                        state["pose"],
+                        state["focal_scale"],
+                        state["translation_step"],
+                        state["rotation_step"],
+                        need_render,
+                    ) = _apply_key(
+                        key,
+                        state["pose"],
+                        start_pose,
+                        state["focal_scale"],
+                        state["translation_step"],
+                        state["rotation_step"],
+                        args,
+                    )
+                    if need_render:
+                        rerender()
+                    state["message"] = ""
+                self._send(200, "application/json", state_json())
+            except Exception as exc:
+                body = json.dumps({"error": str(exc)}).encode("utf-8")
+                self._send(500, "application/json", body)
+
+    server = HTTPServer((args.host, args.port), Handler)
+    print("\n[pose-tuner] headless web UI ready")
+    print(f"[pose-tuner] remote URL : http://{args.host}:{args.port}")
+    print(
+        f"[pose-tuner] VS Code SSH: open the Ports panel, forward port {args.port}, "
+        "then click Open in Browser."
+    )
+    print("[pose-tuner] Ctrl+C stops the server; saved candidates/final remain on disk.\n")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[pose-tuner] web UI stopped")
+    finally:
+        server.server_close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -230,6 +567,9 @@ def main() -> None:
     parser.add_argument("--fov_step", type=float, default=1.05)
     parser.add_argument("--znear", type=float, default=0.1)
     parser.add_argument("--zfar", type=float, default=50.0)
+    parser.add_argument("--ui", choices=("auto", "opencv", "web"), default="auto")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
 
     run_dir = args.run_dir.expanduser().resolve()
@@ -273,20 +613,16 @@ def main() -> None:
     print(f"[pose-tuner] Gaussians : {int(gaussians.get_xyz.shape[0])}")
     _print_help()
 
-    candidate_idx = 0
-    window = "P001 teaser pose tuner"
-    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-
-    def render_current() -> np.ndarray:
+    def render_current(current_pose: torch.Tensor, current_focal_scale: float) -> np.ndarray:
         camera = _make_camera(
             get_projection_matrix,
-            pose,
+            current_pose,
             device,
             args.width,
             args.height,
             args.fx_norm,
             args.fy_norm,
-            focal_scale,
+            current_focal_scale,
             args.znear,
             args.zfar,
         )
@@ -302,94 +638,49 @@ def main() -> None:
         torch.cuda.synchronize(device)
         return _tensor_to_bgr(image)
 
-    image_bgr = render_current()
-    while True:
-        display = image_bgr.copy()
-        cv2.putText(
-            display,
-            f"move={translation_step:.4f}m  rot={math.degrees(rotation_step):.3f}deg  focal={focal_scale:.4f}",
-            (12, 26),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.62,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
+    ui = args.ui
+    if ui == "auto":
+        ui = "opencv" if os.environ.get("DISPLAY") else "web"
+
+    if ui == "web":
+        _run_web_ui(
+            render_current,
+            pose,
+            start_pose,
+            focal_scale,
+            translation_step,
+            rotation_step,
+            output_dir,
+            args,
         )
-        cv2.imshow(window, display)
-        key = cv2.waitKey(0) & 0xFF
-        rerender = True
+        return
 
-        if key == 27:  # Esc
-            print("[pose-tuner] exit without saving FINAL")
-            break
-        if key in (10, 13):  # Enter
-            _save_state(output_dir, "final", image_bgr, pose, args, focal_scale)
-            print(f"[pose-tuner] FINAL saved under: {output_dir}")
-            break
-        if key == ord("h"):
-            _print_help()
-            rerender = False
-        elif key == ord("p"):
-            candidate_idx += 1
-            stem = f"candidate_{candidate_idx:03d}"
-            _save_state(output_dir, stem, image_bgr, pose, args, focal_scale)
-            print(f"[pose-tuner] saved {stem}")
-            rerender = False
-        elif key == ord("0"):
-            pose = start_pose.clone()
-            focal_scale = 1.0
-            print("[pose-tuner] reset")
-        elif key == ord("1"):
-            translation_step *= 0.5
-            print(f"[pose-tuner] translation step = {translation_step:.6f} m")
-            rerender = False
-        elif key == ord("2"):
-            translation_step *= 2.0
-            print(f"[pose-tuner] translation step = {translation_step:.6f} m")
-            rerender = False
-        elif key == ord("3"):
-            rotation_step *= 0.5
-            print(f"[pose-tuner] rotation step = {math.degrees(rotation_step):.6f} deg")
-            rerender = False
-        elif key == ord("4"):
-            rotation_step *= 2.0
-            print(f"[pose-tuner] rotation step = {math.degrees(rotation_step):.6f} deg")
-            rerender = False
-        elif key == ord("["):
-            focal_scale /= args.fov_step
-        elif key == ord("]"):
-            focal_scale *= args.fov_step
-        elif key == ord("w"):
-            _translate_local(pose, 0.0, 0.0, translation_step)
-        elif key == ord("s"):
-            _translate_local(pose, 0.0, 0.0, -translation_step)
-        elif key == ord("a"):
-            _translate_local(pose, -translation_step, 0.0, 0.0)
-        elif key == ord("d"):
-            _translate_local(pose, translation_step, 0.0, 0.0)
-        elif key == ord("r"):
-            _translate_local(pose, 0.0, -translation_step, 0.0)
-        elif key == ord("f"):
-            _translate_local(pose, 0.0, translation_step, 0.0)
-        elif key == ord("j"):
-            _rotate_local(pose, _rot_y(-rotation_step))
-        elif key == ord("l"):
-            _rotate_local(pose, _rot_y(rotation_step))
-        elif key == ord("i"):
-            _rotate_local(pose, _rot_x(rotation_step))
-        elif key == ord("k"):
-            _rotate_local(pose, _rot_x(-rotation_step))
-        elif key == ord("u"):
-            _rotate_local(pose, _rot_z(-rotation_step))
-        elif key == ord("o"):
-            _rotate_local(pose, _rot_z(rotation_step))
-        else:
-            rerender = False
-
-        if rerender:
-            image_bgr = render_current()
-
-    cv2.destroyAllWindows()
+    try:
+        _run_opencv_ui(
+            render_current,
+            pose,
+            start_pose,
+            focal_scale,
+            translation_step,
+            rotation_step,
+            output_dir,
+            args,
+        )
+    except cv2.error as exc:
+        if args.ui != "auto":
+            raise
+        print(f"[pose-tuner] OpenCV GUI unavailable: {exc}")
+        print("[pose-tuner] falling back to headless web UI")
+        _run_web_ui(
+            render_current,
+            pose,
+            start_pose,
+            focal_scale,
+            translation_step,
+            rotation_step,
+            output_dir,
+            args,
+        )
 
 
 if __name__ == "__main__":
