@@ -37,14 +37,19 @@ PY
   )
   TAG="full"
 else
-  # Old ReSplat command used inclusive --packet_ranges 0-20 -> 21 packets.
+  # END_INDEX follows Python slicing semantics: [0, END_INDEX).
+  # Default 21 preserves the old inclusive --packet_ranges 0-20 smoke test.
   END_INDEX="${END_INDEX:-21}"
-  TAG="0_20"
+  TAG="custom"
 fi
 
 if (( END_INDEX <= 0 )); then
   echo "[fatal] invalid END_INDEX=$END_INDEX" >&2
   exit 2
+fi
+
+if [[ "$FULL" != "1" ]]; then
+  TAG="0_$((END_INDEX - 1))"
 fi
 
 WORK="$OUTPUT_ROOT/$TAG"
