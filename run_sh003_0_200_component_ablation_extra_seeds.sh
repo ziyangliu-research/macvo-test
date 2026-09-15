@@ -3,7 +3,8 @@ set -u
 
 # Two additional seeds (1,2) for the five-row SH003 component ablation.
 # Existing seed-0 results are preserved and are NOT rerun here.
-# This launcher ALWAYS reruns seed1/seed2: existing target directories are removed.
+# Completed seed1/seed2 cases are skipped when execution_benchmark_summary.json exists.
+# Incomplete cases are rerun in-place without deleting their work directories.
 #
 # Common protocol:
 #   SH003 [0,200), strict 8:2 = 160 mapping + 40 held-out
@@ -36,9 +37,13 @@ run_case() {
 
   local work_dir="$ROOT/seed${seed}/${mode}"
   local output_name="incremental_component_${mode}_seed${seed}"
+  local summary="$work_dir/execution_benchmark_summary.json"
 
-  # Explicit fresh rerun: never skip because an old summary exists.
-  rm -rf "$work_dir"
+  if [[ -f "$summary" ]]; then
+    echo "[skip complete] seed=$seed | $label | $summary"
+    return 0
+  fi
+
   mkdir -p "$work_dir"
 
   cat > "$work_dir/protocol.txt" <<EOF
@@ -59,7 +64,7 @@ EOF
 
   echo
   echo "================================================================================"
-  echo "Component ablation fresh run | seed=$seed | $label"
+  echo "Component ablation run | seed=$seed | $label"
   echo "SH003 [0,200) | strict 8:2 | W20/B100/M50 | Th=$threshold | replay=$replay"
   echo "work_dir=$work_dir"
   echo "================================================================================"
@@ -122,7 +127,8 @@ done
 
 echo
 echo "================================================================================"
-echo "Finished component-ablation seed1/seed2 reruns."
+echo "Finished component-ablation seed1/seed2 pass."
+echo "Completed cases were skipped; incomplete cases were rerun without deleting work dirs."
 echo "Existing seed-0 results were not touched."
-echo "New results: $ROOT/seed1 and $ROOT/seed2"
+echo "Results: $ROOT/seed1 and $ROOT/seed2"
 echo "================================================================================"
