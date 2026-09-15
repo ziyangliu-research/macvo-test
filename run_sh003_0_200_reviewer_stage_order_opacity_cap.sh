@@ -1,22 +1,21 @@
 #!/usr/bin/env bash
 set -u
 
-# Reviewer-requested controlled ablations on SH003 [0,200), strict held-out 8:2.
-# Common protocol for every case:
+# Reviewer-requested stage-order ablation on SH003 [0,200), strict held-out 8:2.
+# Common protocol for both cases:
 #   W=20, rho=.30, B=100, M=50, Th=.10, refine_steps=0
+#   insertion opacity cap=.01
 #   160 mapping/train + 40 held-out test timestamps
 #   serial execution, ReSplat default CUDA stream, seed fixed
 #   no intermediate metric rendering, no global/post-hoc refinement
 #
-# Three fresh runs share one baseline:
+# Two fresh runs:
 #   A baseline_two_stage_cap001:
-#       recent-only through M=50 -> prune -> mixed replay, insertion alpha cap=.01
+#       recent-only through M=50 -> prune -> mixed replay
 #   B mixed_from_start_cap001:
-#       exact same 70 recent + 30 history updates, but history spread from iter 1,
-#       insertion alpha cap=.01
-#   C two_stage_no_insertion_cap:
-#       same stage order as A, but ReSplat packet opacity is inserted unchanged
-#       (backend.reset_new_packet_opacity=false)
+#       exact same 70 recent + 30 history updates, but history spread from iter 1
+#
+# Only stage order changes between A and B.
 
 cd /home/shiyo/Desktop/MAC-VO || exit 1
 
@@ -32,7 +31,6 @@ mkdir -p "$ROOT"
 run_case() {
   local case_name="$1"
   local replay_order="$2"
-  local cap_enabled="$3"
   local work_dir="$ROOT/$case_name"
   local output_name="incremental_${case_name}"
   local summary="$work_dir/execution_benchmark_summary.json"
@@ -52,16 +50,16 @@ B=100
 M=50
 prune_threshold=0.10
 replay_order=$replay_order
-reset_new_packet_opacity=$cap_enabled
+reset_new_packet_opacity=true
 new_packet_reset_max_opacity=0.01
 seed=$SEED
 EOF
 
   echo
   echo "======================================================================"
-  echo "Reviewer ablation: $case_name"
-  echo "SH003 [0,200) | strict 8:2 | W20/R30/B100/M50/Th.10"
-  echo "replay_order=$replay_order | insertion_cap_enabled=$cap_enabled"
+  echo "Reviewer stage-order ablation: $case_name"
+  echo "SH003 [0,200) | strict 8:2 | W20/R30/B100/M50/Th.10 | cap=.01"
+  echo "replay_order=$replay_order"
   echo "======================================================================"
 
   set +e
@@ -86,7 +84,7 @@ EOF
     --set split.split_index_mode=local_index \
     --set backend.local_map_size=20 \
     --set backend.iterations_per_packet=100 \
-    --set backend.reset_new_packet_opacity="$cap_enabled" \
+    --set backend.reset_new_packet_opacity=true \
     --set backend.new_packet_reset_max_opacity=0.01 \
     --set backend.maintenance_mode=standard \
     --set backend.maintenance_after_local_iteration=50 \
@@ -111,14 +109,12 @@ EOF
   fi
 }
 
-# Fresh common baseline, then the two one-factor ablations.
-run_case baseline_two_stage_cap001 post_maintenance true
-run_case mixed_from_start_cap001 from_start true
-run_case two_stage_no_insertion_cap post_maintenance false
+run_case baseline_two_stage_cap001 post_maintenance
+run_case mixed_from_start_cap001 from_start
 
 echo
 echo "======================================================================"
-echo "Reviewer ablation runs finished."
+echo "Stage-order ablation runs finished."
 echo "Summarize with:"
 echo "  python summarize_sh003_reviewer_stage_order_opacity_cap.py --root $ROOT"
 echo "======================================================================"
