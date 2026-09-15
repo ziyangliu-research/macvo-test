@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize reviewer-requested SH003 stage-order / insertion-cap ablations.
+"""Summarize the reviewer-requested SH003 stage-order ablation.
 
 Online FPS is reconstructed from frame_timing_log.json as
 
@@ -18,7 +18,6 @@ from typing import Any
 CASES = (
     ("baseline_two_stage_cap001", "Two-stage + cap .01"),
     ("mixed_from_start_cap001", "Mixed from start + cap .01"),
-    ("two_stage_no_insertion_cap", "Two-stage + no cap"),
 )
 
 
@@ -93,7 +92,7 @@ def main() -> None:
             }
         )
 
-    print("\nSH003 [0,200) reviewer ablations | strict 8:2 | W20/R30/B100/M50/Th.10")
+    print("\nSH003 [0,200) stage-order ablation | strict 8:2 | W20/R30/B100/M50/Th.10 | cap=.01")
     print(
         f"{'Variant':31s} {'Train P/S':>19s} {'Test P/S':>19s} "
         f"{'G':>12s} {'FPS':>9s}"
